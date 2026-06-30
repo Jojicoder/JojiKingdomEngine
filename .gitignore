@@ -1,0 +1,6 @@
+build/
+output/
+.claude/
+.DS_Store
+*.log
+*.tmp
