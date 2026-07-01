@@ -168,8 +168,19 @@ void DiplomacyEngine::processPendingProposals(
             KingdomID winner = proposerWeaker ? proposal.recipient : proposal.proposer;
             KingdomID loser  = proposerWeaker ? proposal.proposer  : proposal.recipient;
             // Only cede if meaningful difference (avoid mutual exhaustion giving nothing)
-            if (kingdoms.at(loser).warWeariness > 0.35f ||
-                kingdoms.at(loser).stability < 0.55f) {
+            int occupiedClaims = 0;
+            for (CityID cid : kingdoms.at(winner).cities) {
+                if (!cities.count(cid)) continue;
+                const City& city = cities.at(cid);
+                if (city.owner == winner && city.originalOwner == loser) ++occupiedClaims;
+            }
+            const bool decisiveCollapse =
+                kingdoms.at(loser).warWeariness > 0.65f ||
+                kingdoms.at(loser).stability < 0.42f;
+            const bool earnedSettlement = occupiedClaims > 0 || decisiveCollapse;
+            if (earnedSettlement &&
+                (kingdoms.at(loser).warWeariness > 0.35f ||
+                 kingdoms.at(loser).stability < 0.55f)) {
                 ceedTerritory(winner, loser, kingdoms, cities, turn);
             }
         }

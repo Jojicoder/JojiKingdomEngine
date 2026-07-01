@@ -30,7 +30,10 @@ void SimulationEngine::setSerializer(std::unique_ptr<SnapshotSerializer> s) {
 }
 
 bool SimulationEngine::step() {
-    if (simulationOver_ || currentTurn_ >= config_.maxTurns) return false;
+    if (simulationOver_ ||
+        (config_.maxTurns != 0 && currentTurn_ >= config_.maxTurns)) {
+        return false;
+    }
 
     currentTurn_++;
     runTurn();
@@ -53,7 +56,10 @@ void SimulationEngine::run() {
     if (config_.verbose) {
         std::cout << "=== JojiKingdomEngine ===\n";
         std::cout << "Seed: " << config_.seed << "\n";
-        std::cout << "Max turns: " << config_.maxTurns << "\n";
+        if (config_.maxTurns == 0)
+            std::cout << "Max turns: unlimited (until unification)\n";
+        else
+            std::cout << "Max turns: " << config_.maxTurns << "\n";
         std::cout << "Starting kingdoms: " << kingdoms_.size() << "\n\n";
     }
 
@@ -177,14 +183,14 @@ void SimulationEngine::initializeWorld() {
         k.treasury.stone += 80.0f;
         k.treasury.gold  += 60.0f;
 
-        // Claim 8 tiles outward from capital so city founding can work from Turn 30
+        // Claim 10 tiles outward from capital so city founding can work early
         if (k.capitalCity != NO_CITY && cities_.count(k.capitalCity)) {
             TileID capTile = cities_.at(k.capitalCity).tile;
             if (capTile != NO_TILE) {
-                // BFS up to 3 steps from capital, claim land tiles
+                // BFS up to 10 steps from capital, claim land tiles
                 std::vector<TileID> frontier = {capTile};
                 std::unordered_set<TileID> visited = {capTile};
-                for (int depth = 0; depth < 3 && !frontier.empty(); ++depth) {
+                for (int depth = 0; depth < 10 && !frontier.empty(); ++depth) {
                     std::vector<TileID> next;
                     for (TileID t : frontier) {
                         TileID nbs[4]; int nc = worldMap_.neighbors4(t, nbs);
@@ -445,7 +451,7 @@ void SimulationEngine::runTurn() {
     techEngine_.update(kingdoms_, techTree_, eventBus_, currentTurn_);
     eventBus_.flush();
 
-    // 2.5 War momentum: Aggressive get combat boost while fighting (applied after tech reset)
+    // 2.5 War momentum: militarist cultures get combat boost while fighting (applied after tech reset)
     {
         auto isWarring = [&](KingdomID a, KingdomID b) {
             auto lo = std::min(a,b), hi = std::max(a,b);
@@ -455,7 +461,12 @@ void SimulationEngine::runTurn() {
             return it2 != it->second.end() && it2->second.state == RelationState::War;
         };
         for (auto& [kid, k] : kingdoms_) {
-            if (!k.isAlive || k.personality != KingdomPersonality::Aggressive) continue;
+            if (!k.isAlive) continue;
+            const bool hasWarCulture =
+                k.personality == KingdomPersonality::Aggressive ||
+                k.personality == KingdomPersonality::Expansionist ||
+                k.personality == KingdomPersonality::Opportunistic;
+            if (!hasWarCulture) continue;
             bool fighting = false;
             for (const auto& [oid, ok] : kingdoms_) {
                 if (oid == kid || !ok.isAlive) continue;
@@ -463,7 +474,19 @@ void SimulationEngine::runTurn() {
             }
             // combatBonus was just reset by TechEngine; add war momentum on top
             if (fighting) {
-                k.combatBonus *= std::min(1.50f, 1.0f + k.warWeariness * 0.50f + 0.12f);
+                float base = 0.08f;
+                float wearScale = 0.32f;
+                float cap = 1.34f;
+                if (k.personality == KingdomPersonality::Aggressive) {
+                    base = 0.12f;
+                    wearScale = 0.50f;
+                    cap = 1.50f;
+                } else if (k.personality == KingdomPersonality::Expansionist) {
+                    base = 0.10f;
+                    wearScale = 0.38f;
+                    cap = 1.42f;
+                }
+                k.combatBonus *= std::min(cap, 1.0f + k.warWeariness * wearScale + base);
             }
         }
     }
@@ -922,8 +945,9 @@ void SimulationEngine::updateStrategicPostures() {
             kingdoms_.at(k.revengeTarget).isAlive;
 
         KingdomID lateWarTarget = NO_KINGDOM;
-        // Earlier trigger (800 turns, ≤8 alive) — endgame should converge
-        if (currentTurn_ >= 800 && alive.size() <= 8) {
+        // Earlier trigger (700 turns, ≤12 alive) — endgame should converge
+        // without changing the actual victory condition.
+        if (currentTurn_ >= 700 && alive.size() <= 12) {
             for (KingdomID otherId : alive) {
                 if (otherId == kid) continue;
                 if (lateWarTarget == NO_KINGDOM ||
@@ -1047,8 +1071,29 @@ void SimulationEngine::assignArmyRoles() {
         }
         defenseSlots = std::min(defenseSlots, static_cast<int>(living.size()));
 
+        int reserveSlots = 0;
+        if (k.campaignPlan.active()) {
+            reserveSlots = static_cast<int>(
+                std::round(static_cast<float>(living.size()) * k.campaignPlan.reserveRatio));
+            if (k.campaignPlan.phase == CampaignPhase::Resupply) {
+                reserveSlots = std::max(reserveSlots, static_cast<int>(living.size()) / 2);
+            }
+            if (k.campaignPlan.supportAlly && living.size() >= 4) {
+                reserveSlots = std::max(1, reserveSlots - 1);
+            }
+        }
+        reserveSlots = std::clamp(reserveSlots, 0, std::max(0, static_cast<int>(living.size()) - defenseSlots));
+
+        std::vector<ArmyID> plannedReserves;
         for (int i = 0; i < defenseSlots; ++i) {
             armies_.at(living[i]).role = ArmyRole::Defense;
+        }
+        for (int i = 0; i < reserveSlots; ++i) {
+            const size_t idx = static_cast<size_t>(defenseSlots + i);
+            if (idx < living.size()) {
+                armies_.at(living[idx]).role = ArmyRole::Reserve;
+                plannedReserves.push_back(living[idx]);
+            }
         }
 
         ArmyID siegeArmy = NO_ARMY;
@@ -1091,6 +1136,12 @@ void SimulationEngine::assignArmyRoles() {
 
             const bool depleted = army.totalSoldiers() < 450 || army.supplyLevel < 0.25f;
             if (depleted && k.policy != NationalPolicy::FinalWar) {
+                army.role = ArmyRole::Reserve;
+            } else if (std::find(plannedReserves.begin(), plannedReserves.end(), aid) != plannedReserves.end()) {
+                army.role = ArmyRole::Reserve;
+            } else if (k.campaignPlan.active() &&
+                       k.campaignPlan.phase == CampaignPhase::Resupply &&
+                       k.policy != NationalPolicy::FinalWar) {
                 army.role = ArmyRole::Reserve;
             } else if (k.policy == NationalPolicy::Invading ||
                        k.policy == NationalPolicy::FinalWar) {
@@ -1305,25 +1356,40 @@ bool SimulationEngine::checkDominationVictory() {
         cityShare >= 0.38f &&
         militaryRatio >= 1.25f;
 
-    // forcedConclusion: Turn 1900 hard cap — winner is whoever has the strongest ARMY
-    // Pure military power determines the final ruler
-    KingdomID militaryLeader = NO_KINGDOM;
-    uint64_t  topMilitary = 0;
-    for (KingdomID kid : alive) {
-        uint64_t mp = militaryPower(kingdoms_.at(kid));
-        if (mp > topMilitary) { topMilitary = mp; militaryLeader = kid; }
+    // grandAlliance (Diplomatic victory): a kingdom holding alliances with ≥55% of remaining
+    // kingdoms demonstrates diplomatic supremacy — Pax Diplomatica
+    KingdomID grandAllianceLeader = NO_KINGDOM;
+    if (currentTurn_ >= 1500 && alive.size() >= 3) {
+        for (KingdomID kid : alive) {
+            const Kingdom& k = kingdoms_.at(kid);
+            if (k.personality != KingdomPersonality::Diplomatic) continue;
+            int allyCount = 0;
+            for (KingdomID oid : alive) {
+                if (oid == kid) continue;
+                KingdomID lo = std::min(kid, oid), hi = std::max(kid, oid);
+                auto it = relations_.find(lo);
+                if (it == relations_.end()) continue;
+                auto it2 = it->second.find(hi);
+                if (it2 == it->second.end()) continue;
+                if (it2->second.state == RelationState::Alliance) ++allyCount;
+            }
+            if (allyCount >= static_cast<int>(alive.size() - 1) * 55 / 100) {
+                grandAllianceLeader = kid;
+                break;
+            }
+        }
     }
-    const bool forcedConclusion = currentTurn_ >= 1900 && militaryLeader != NO_KINGDOM;
+    const bool grandAlliance = (grandAllianceLeader != NO_KINGDOM);
 
     if (!continentHegemon && !twoPowerSubmission && !exhaustedLateGame &&
-        !imperialSettlement && !forcedConclusion) {
+        !imperialSettlement && !grandAlliance) {
         return false;
     }
 
-    // For forcedConclusion: override leader with the military champion
-    if (forcedConclusion && !continentHegemon && !twoPowerSubmission &&
+    // Grand Alliance: Diplomatic pax — override leader
+    if (grandAlliance && !continentHegemon && !twoPowerSubmission &&
         !exhaustedLateGame && !imperialSettlement) {
-        leader = militaryLeader;
+        leader = grandAllianceLeader;
     }
 
     Kingdom& finalWinner = kingdoms_.at(leader);
@@ -1613,6 +1679,554 @@ void SimulationEngine::runAIPhase() {
                 warEnemy = otherId;
                 break;
             }
+        }
+
+        auto tileDistance = [&](TileID a, TileID b) {
+            auto ap = worldMap_.at(a).position;
+            auto bp = worldMap_.at(b).position;
+            return std::hypot(float(ap.x - bp.x), float(ap.y - bp.y));
+        };
+
+        auto isWarGoalTargetValid = [&](const Kingdom& ownerKingdom) {
+            if (!ownerKingdom.currentWarGoal.active()) return false;
+            if (!kingdoms_.count(ownerKingdom.currentWarGoal.enemy) ||
+                !kingdoms_.at(ownerKingdom.currentWarGoal.enemy).isAlive) return false;
+            const DiplomaticRelation* rel =
+                relationBetween(ownerKingdom.id, ownerKingdom.currentWarGoal.enemy);
+            return rel && rel->state == RelationState::War;
+        };
+
+        auto chooseWarGoal = [&](Kingdom& actorKingdom, KingdomID enemyId) {
+            if (enemyId == NO_KINGDOM || !kingdoms_.count(enemyId)) {
+                actorKingdom.currentWarGoal = WarGoal{};
+                return;
+            }
+            if (isWarGoalTargetValid(actorKingdom) &&
+                actorKingdom.currentWarGoal.enemy == enemyId &&
+                currentTurn_ < actorKingdom.currentWarGoal.startedTurn +
+                    std::max<TurnNumber>(18, actorKingdom.currentWarGoal.maxTurns / 3)) {
+                return;
+            }
+
+            const Kingdom& enemy = kingdoms_.at(enemyId);
+            WarGoal goal;
+            goal.enemy = enemyId;
+            goal.startedTurn = currentTurn_;
+
+            if (actorKingdom.policy == NationalPolicy::FinalWar ||
+                actorKingdom.strategyPlan == StrategyPlan::TotalConquest) {
+                goal.type = WarGoalType::TotalConquest;
+                goal.maxTurns = 180;
+                goal.desiredCaptures = std::max(2, static_cast<int>(enemy.cities.size()));
+                goal.requiredForceRatio = 0.62f;
+                goal.allowPeaceAfterGoal = false;
+            } else if (actorKingdom.strategyPlan == StrategyPlan::TurtleDefense) {
+                goal.type = WarGoalType::DefensiveHold;
+                goal.maxTurns = 55;
+                goal.desiredCaptures = 0;
+                goal.requiredForceRatio = 0.95f;
+            } else if (actorKingdom.strategyPlan == StrategyPlan::AntiHegemonWar) {
+                goal.type = WarGoalType::AntiHegemon;
+                goal.maxTurns = 120;
+                goal.desiredCaptures = 2;
+                goal.requiredForceRatio = 0.78f;
+            } else if (actorKingdom.strategyPlan == StrategyPlan::CapitalRush) {
+                goal.type = WarGoalType::Capital;
+                goal.maxTurns = 110;
+                goal.desiredCaptures = 2;
+                goal.requiredForceRatio = 0.70f;
+            } else if (actorKingdom.strategyPlan == StrategyPlan::RevengeWar) {
+                goal.type = WarGoalType::Punitive;
+                goal.maxTurns = 90;
+                goal.desiredCaptures = 1;
+                goal.requiredForceRatio = 0.74f;
+            } else if (actorKingdom.strategyPlan == StrategyPlan::OpportunisticRaid) {
+                goal.type = WarGoalType::SupplyHub;
+                goal.maxTurns = 70;
+                goal.desiredCaptures = 1;
+                goal.requiredForceRatio = 0.66f;
+            } else {
+                goal.type = WarGoalType::BorderCities;
+                goal.maxTurns = 85;
+                goal.desiredCaptures = actorKingdom.personality == KingdomPersonality::Expansionist ? 2 : 1;
+                goal.requiredForceRatio = 0.82f;
+            }
+
+            if (actorKingdom.personality == KingdomPersonality::Economic ||
+                actorKingdom.personality == KingdomPersonality::Diplomatic) {
+                goal.maxTurns = std::min<TurnNumber>(goal.maxTurns, 65);
+                goal.requiredForceRatio += 0.08f;
+            } else if (actorKingdom.personality == KingdomPersonality::Aggressive ||
+                       actorKingdom.personality == KingdomPersonality::Expansionist) {
+                goal.maxTurns += 25;
+                goal.requiredForceRatio -= 0.06f;
+            }
+
+            struct GoalCityCandidate {
+                CityID city;
+                float score;
+            };
+            auto nearestOwnedCityDistance = [&](TileID target) {
+                float bestDist = 1e9f;
+                for (CityID ownCid : actorKingdom.cities) {
+                    if (!cities_.count(ownCid)) continue;
+                    const City& ownCity = cities_.at(ownCid);
+                    if (ownCity.owner != actorKingdom.id || ownCity.tile == NO_TILE) continue;
+                    bestDist = std::min(bestDist, tileDistance(ownCity.tile, target));
+                }
+                return bestDist > 1e8f ? 0.0f : bestDist;
+            };
+            auto nearbyOwnedTerritory = [&](TileID center) {
+                if (center == NO_TILE ||
+                    center >= static_cast<TileID>(worldMap_.tileCount())) return 0;
+                std::vector<TileID> frontier{center};
+                std::unordered_set<TileID> visited{center};
+                int ownedPressure = 0;
+                for (int depth = 0; depth < 4 && !frontier.empty(); ++depth) {
+                    std::vector<TileID> next;
+                    for (TileID tile : frontier) {
+                        for (TileID nid : worldMap_.neighbors8(tile)) {
+                            if (!visited.insert(nid).second) continue;
+                            if (worldMap_.at(nid).owner == actorKingdom.id) {
+                                ownedPressure += 5 - depth;
+                            }
+                            next.push_back(nid);
+                        }
+                    }
+                    frontier = std::move(next);
+                }
+                return ownedPressure;
+            };
+
+            std::vector<GoalCityCandidate> candidates;
+            for (CityID cid : enemy.cities) {
+                if (!cities_.count(cid)) continue;
+                const City& city = cities_.at(cid);
+                if (city.owner != enemyId || city.tile == NO_TILE) continue;
+                if (city.isCapital && goal.type != WarGoalType::Capital &&
+                    goal.type != WarGoalType::TotalConquest &&
+                    enemy.cities.size() > 1) {
+                    continue;
+                }
+
+                const float nearestBaseDist = nearestOwnedCityDistance(city.tile);
+                const int ownedPressure = nearbyOwnedTerritory(city.tile);
+                float score = nearestBaseDist;
+                score += std::max(0.0f, nearestBaseDist - 28.0f) * 1.8f;
+                score -= std::min(32.0f, static_cast<float>(ownedPressure) * 1.15f);
+                if (nearestBaseDist <= 14.0f) score -= 16.0f;
+                else if (nearestBaseDist <= 24.0f) score -= 8.0f;
+                const bool hub = city.cityType == CityType::Fortress ||
+                                 city.cityType == CityType::TradeHub ||
+                                 city.cityType == CityType::Port;
+                const bool localTown =
+                    !city.isCapital &&
+                    (city.cityType == CityType::Generic ||
+                     city.cityType == CityType::Agricultural);
+                if (localTown) {
+                    float townValue = 10.0f;
+                    townValue += std::min(10.0f, static_cast<float>(city.population) * 0.010f);
+                    if (ownedPressure > 0) townValue += 10.0f;
+                    if (nearestBaseDist <= 18.0f) townValue += 8.0f;
+                    if (city.cityType == CityType::Agricultural) townValue += 5.0f;
+                    score -= townValue;
+                }
+                if (goal.type == WarGoalType::SupplyHub ||
+                    goal.type == WarGoalType::AntiHegemon) {
+                    if (hub) score -= 32.0f;
+                    if (city.cityType == CityType::Mining) score -= 10.0f;
+                }
+                if (goal.type == WarGoalType::Capital && city.isCapital) score -= 90.0f;
+                if (goal.type == WarGoalType::Punitive && city.originalOwner == actorKingdom.id) score -= 70.0f;
+                if (goal.type == WarGoalType::BorderCities && hub) score -= 8.0f;
+                score += city.fortification * 8.0f;
+                candidates.push_back({cid, score});
+            }
+            std::sort(candidates.begin(), candidates.end(),
+                      [](const GoalCityCandidate& a, const GoalCityCandidate& b) {
+                          return a.score < b.score;
+                      });
+            const size_t goalCityLimit =
+                goal.type == WarGoalType::TotalConquest ? 5u :
+                goal.type == WarGoalType::Capital ? 3u : 3u;
+            for (const auto& c : candidates) {
+                if (goal.targetCities.size() >= goalCityLimit) break;
+                goal.targetCities.push_back(c.city);
+            }
+            if (goal.targetCities.empty() && enemy.capitalCity != NO_CITY) {
+                goal.targetCities.push_back(enemy.capitalCity);
+            }
+
+            actorKingdom.currentWarGoal = std::move(goal);
+        };
+
+        if (warEnemy != NO_KINGDOM) {
+            chooseWarGoal(k, warEnemy);
+        } else {
+            k.currentWarGoal = WarGoal{};
+            k.campaignPlan = CampaignPlan{};
+            k.aiReason = "At peace: rebuilding economy and reserves.";
+        }
+
+        auto chooseCampaignPlan = [&](Kingdom& actorKingdom) {
+            CampaignPlan plan;
+            if (!actorKingdom.currentWarGoal.active()) {
+                actorKingdom.campaignPlan = plan;
+                return;
+            }
+
+            plan.enemy = actorKingdom.currentWarGoal.enemy;
+            plan.primaryObjective = actorKingdom.currentWarGoal.targetCities.empty()
+                ? NO_CITY : actorKingdom.currentWarGoal.targetCities.front();
+            if (actorKingdom.currentWarGoal.targetCities.size() >= 2) {
+                plan.secondaryObjective = actorKingdom.currentWarGoal.targetCities[1];
+            }
+
+            if (season == Season::Spring) plan.phase = CampaignPhase::Invasion;
+            else if (season == Season::Summer) plan.phase = CampaignPhase::Battle;
+            else if (season == Season::Autumn) plan.phase = CampaignPhase::Siege;
+            else plan.phase = CampaignPhase::Resupply;
+
+            plan.reserveRatio = 0.22f;
+            plan.retreatSupply = 0.36f;
+            plan.commitThreshold = actorKingdom.currentWarGoal.requiredForceRatio;
+            if (actorKingdom.personality == KingdomPersonality::Defensive ||
+                actorKingdom.personality == KingdomPersonality::Economic) {
+                plan.reserveRatio += 0.12f;
+                plan.retreatSupply += 0.06f;
+                plan.commitThreshold += 0.08f;
+            }
+            if (actorKingdom.personality == KingdomPersonality::Aggressive ||
+                actorKingdom.personality == KingdomPersonality::Expansionist) {
+                plan.reserveRatio -= 0.06f;
+                plan.retreatSupply -= 0.04f;
+                plan.commitThreshold -= 0.05f;
+            }
+            if (actorKingdom.recentDefeats > 0 &&
+                currentTurn_ <= actorKingdom.lastDefeatTurn + 90) {
+                plan.reserveRatio += std::min(0.22f, actorKingdom.recentDefeats * 0.045f);
+                plan.retreatSupply += std::min(0.12f, actorKingdom.recentDefeats * 0.025f);
+                plan.commitThreshold += std::min(0.16f, actorKingdom.recentDefeats * 0.035f);
+            } else if (actorKingdom.recentDefeats > 0 &&
+                       currentTurn_ > actorKingdom.lastDefeatTurn + 90) {
+                actorKingdom.recentDefeats = std::max(0, actorKingdom.recentDefeats - 1);
+            }
+            if (plan.phase == CampaignPhase::Resupply) {
+                plan.reserveRatio = std::max(plan.reserveRatio, 0.45f);
+                plan.retreatSupply += 0.08f;
+            } else if (plan.phase == CampaignPhase::Siege) {
+                plan.reserveRatio += 0.05f;
+            }
+            plan.reserveRatio = std::clamp(plan.reserveRatio, 0.10f, 0.62f);
+            plan.retreatSupply = std::clamp(plan.retreatSupply, 0.28f, 0.58f);
+            plan.commitThreshold = std::clamp(plan.commitThreshold, 0.55f, 1.10f);
+
+            const DiplomaticRelation* allyRel = nullptr;
+            for (const auto& [allyId, ally] : kingdoms_) {
+                if (allyId == actorKingdom.id || !ally.isAlive) continue;
+                allyRel = relationBetween(actorKingdom.id, allyId);
+                if (!allyRel || allyRel->state != RelationState::Alliance) continue;
+                if (!ally.currentWarGoal.active() ||
+                    ally.currentWarGoal.enemy != actorKingdom.currentWarGoal.enemy) continue;
+                if (!ally.currentWarGoal.targetCities.empty()) {
+                    plan.primaryObjective = ally.currentWarGoal.targetCities.front();
+                    plan.supportAlly = true;
+                    break;
+                }
+            }
+
+            if (actorKingdom.armies.size() >= 5 &&
+                plan.secondaryObjective != NO_CITY &&
+                plan.phase != CampaignPhase::Resupply) {
+                plan.diversion = true;
+            }
+
+            if (plan.primaryObjective != NO_CITY && cities_.count(plan.primaryObjective)) {
+                CityID bestBase = NO_CITY;
+                float bestDist = 1e9f;
+                for (CityID cid : actorKingdom.cities) {
+                    if (!cities_.count(cid) || cities_.at(cid).owner != actorKingdom.id) continue;
+                    float dist = tileDistance(cities_.at(cid).tile, cities_.at(plan.primaryObjective).tile);
+                    if (dist < bestDist) {
+                        bestDist = dist;
+                        bestBase = cid;
+                    }
+                }
+                plan.stagingCity = bestBase;
+            }
+
+            auto nearestOwnedCity = [&](TileID tile) {
+                CityID bestBase = NO_CITY;
+                float bestDist = 1e9f;
+                for (CityID cid : actorKingdom.cities) {
+                    if (!cities_.count(cid) || cities_.at(cid).owner != actorKingdom.id) continue;
+                    float dist = tileDistance(cities_.at(cid).tile, tile);
+                    if (dist < bestDist) {
+                        bestDist = dist;
+                        bestBase = cid;
+                    }
+                }
+                return bestBase;
+            };
+
+            auto addFront = [&](CampaignFront front) {
+                if (front.objective == NO_CITY || !cities_.count(front.objective)) return;
+                if (front.stagingCity == NO_CITY) {
+                    front.stagingCity = front.defensive
+                        ? front.objective
+                        : nearestOwnedCity(cities_.at(front.objective).tile);
+                }
+                auto existing = std::find_if(plan.fronts.begin(), plan.fronts.end(),
+                    [&](const CampaignFront& f) {
+                        return f.objective == front.objective && f.defensive == front.defensive;
+                    });
+                if (existing != plan.fronts.end()) {
+                    existing->priority = std::max(existing->priority, front.priority);
+                    existing->threat = std::max(existing->threat, front.threat);
+                    existing->opportunity = std::max(existing->opportunity, front.opportunity);
+                    return;
+                }
+                plan.fronts.push_back(front);
+            };
+
+            auto opportunityFor = [&](CityID cid) {
+                if (cid == NO_CITY || !cities_.count(cid)) return 0.0f;
+                const City& city = cities_.at(cid);
+                float score = 18.0f;
+                if (city.isCapital) score += 30.0f;
+                if (city.cityType == CityType::Fortress) score += 16.0f;
+                if (city.cityType == CityType::TradeHub || city.cityType == CityType::Port) score += 12.0f;
+                if (city.cityType == CityType::Mining) score += 10.0f;
+                score += std::min(16.0f, static_cast<float>(city.population) * 0.012f);
+                if (std::find(actorKingdom.currentWarGoal.targetCities.begin(),
+                              actorKingdom.currentWarGoal.targetCities.end(),
+                              cid) != actorKingdom.currentWarGoal.targetCities.end()) {
+                    score += 22.0f;
+                }
+                if (plan.supportAlly) score += 8.0f;
+                if (plan.stagingCity != NO_CITY && cities_.count(plan.stagingCity)) {
+                    score -= std::min(20.0f,
+                        tileDistance(cities_.at(plan.stagingCity).tile, city.tile) * 0.35f);
+                }
+                return score;
+            };
+
+            if (plan.primaryObjective != NO_CITY && cities_.count(plan.primaryObjective)) {
+                const float opportunity = opportunityFor(plan.primaryObjective);
+                addFront({plan.primaryObjective, plan.stagingCity, plan.enemy,
+                          62.0f + opportunity, 0.0f, opportunity, 0.0f, false});
+            }
+            if (plan.secondaryObjective != NO_CITY &&
+                plan.secondaryObjective != plan.primaryObjective &&
+                cities_.count(plan.secondaryObjective)) {
+                const float opportunity = opportunityFor(plan.secondaryObjective);
+                addFront({plan.secondaryObjective, NO_CITY, plan.enemy,
+                          34.0f + opportunity * 0.75f, 0.0f, opportunity, 0.0f, false});
+            }
+
+            CityID threatenedCity = NO_CITY;
+            KingdomID threateningEnemy = plan.enemy;
+            float bestThreat = 0.0f;
+            for (CityID cid : actorKingdom.cities) {
+                if (!cities_.count(cid)) continue;
+                const City& city = cities_.at(cid);
+                if (city.owner != actorKingdom.id || city.tile == NO_TILE) continue;
+                const bool vitalCity = city.isCapital ||
+                    city.cityType == CityType::Fortress ||
+                    city.cityType == CityType::TradeHub ||
+                    city.cityType == CityType::Port ||
+                    city.cityType == CityType::Mining ||
+                    city.population >= 900;
+                if (!vitalCity) continue;
+
+                float threat = 0.0f;
+                KingdomID nearestEnemy = plan.enemy;
+                for (const auto& [enemyAid, enemyArmy] : armies_) {
+                    (void)enemyAid;
+                    if (enemyArmy.owner == actorKingdom.id) continue;
+                    if (!kingdoms_.count(enemyArmy.owner) || !kingdoms_.at(enemyArmy.owner).isAlive) continue;
+                    const DiplomaticRelation* rel = relationBetween(actorKingdom.id, enemyArmy.owner);
+                    if (!rel || rel->state != RelationState::War) continue;
+                    if (enemyArmy.currentTile == NO_TILE ||
+                        enemyArmy.currentTile >= static_cast<TileID>(worldMap_.tileCount())) continue;
+                    float dist = tileDistance(city.tile, enemyArmy.currentTile);
+                    if (dist > 30.0f) continue;
+                    threat += (30.0f - dist) * 1.2f;
+                    threat += static_cast<float>(enemyArmy.totalSoldiers()) * 0.003f;
+                    if (worldMap_.at(enemyArmy.currentTile).owner == actorKingdom.id) threat += 16.0f;
+                    nearestEnemy = enemyArmy.owner;
+                }
+                if (city.isCapital) threat += 10.0f;
+                if (city.cityType == CityType::Fortress) threat += 6.0f;
+                if (threat > bestThreat) {
+                    bestThreat = threat;
+                    threatenedCity = cid;
+                    threateningEnemy = nearestEnemy;
+                }
+            }
+            if (threatenedCity != NO_CITY && bestThreat >= 18.0f) {
+                addFront({threatenedCity, threatenedCity, threateningEnemy,
+                          46.0f + bestThreat, bestThreat, 0.0f, 0.0f, true});
+            }
+
+            std::sort(plan.fronts.begin(), plan.fronts.end(),
+                      [](const CampaignFront& a, const CampaignFront& b) {
+                          return a.priority > b.priority;
+                      });
+            if (plan.fronts.size() > 3) plan.fronts.resize(3);
+            float totalFrontPriority = 0.0f;
+            for (const CampaignFront& front : plan.fronts) {
+                totalFrontPriority += std::max(1.0f, front.priority);
+            }
+            for (CampaignFront& front : plan.fronts) {
+                front.desiredShare = totalFrontPriority > 0.0f
+                    ? std::max(1.0f, front.priority) / totalFrontPriority
+                    : 1.0f / static_cast<float>(std::max<size_t>(1, plan.fronts.size()));
+                if (front.defensive) {
+                    front.desiredShare = std::clamp(front.desiredShare, 0.25f, 0.48f);
+                }
+            }
+
+            std::string phase = std::string(campaignPhaseName(plan.phase));
+            std::string goal = std::string(warGoalTypeName(actorKingdom.currentWarGoal.type));
+            if (plan.primaryObjective != NO_CITY && cities_.count(plan.primaryObjective)) {
+                plan.reason = phase + ": " + goal + " targeting " +
+                    cities_.at(plan.primaryObjective).name;
+            } else {
+                plan.reason = phase + ": " + goal;
+            }
+            if (plan.supportAlly) plan.reason += " with ally support";
+            if (actorKingdom.recentDefeats > 0 &&
+                currentTurn_ <= actorKingdom.lastDefeatTurn + 90) {
+                plan.reason += "; cautious after recent defeat";
+            }
+            if (plan.diversion) plan.reason += "; secondary diversion ready";
+            if (plan.fronts.size() >= 2) {
+                plan.reason += "; " + std::to_string(plan.fronts.size()) + " fronts";
+            }
+            if (std::any_of(plan.fronts.begin(), plan.fronts.end(),
+                            [](const CampaignFront& f) { return f.defensive; })) {
+                plan.reason += "; defensive front held";
+            }
+
+            actorKingdom.aiReason = plan.reason;
+            actorKingdom.campaignPlan = std::move(plan);
+        };
+
+        if (warEnemy != NO_KINGDOM) {
+            chooseCampaignPlan(k);
+        }
+
+        auto kingdomFieldPower = [&](KingdomID owner) {
+            float power = 0.0f;
+            if (!kingdoms_.count(owner)) return power;
+            const Kingdom& ownerKingdom = kingdoms_.at(owner);
+            for (ArmyID aid : ownerKingdom.armies) {
+                auto ait = armies_.find(aid);
+                if (ait == armies_.end() || ait->second.isEmpty()) continue;
+                const Army& army = ait->second;
+                float supply = std::clamp(army.supplyLevel, 0.25f, 1.15f);
+                power += static_cast<float>(army.totalSoldiers()) * supply;
+            }
+            return power;
+        };
+
+        auto capturedCitiesFrom = [&](KingdomID owner, KingdomID formerOwner) {
+            int count = 0;
+            if (!kingdoms_.count(owner)) return count;
+            for (CityID cid : kingdoms_.at(owner).cities) {
+                if (!cities_.count(cid)) continue;
+                const City& city = cities_.at(cid);
+                if (city.owner == owner && city.originalOwner == formerOwner) ++count;
+            }
+            return count;
+        };
+
+        auto shouldOfferObjectivePeace = [&](const Kingdom& actorKingdom, KingdomID enemyId) {
+            if (enemyId == NO_KINGDOM || !kingdoms_.count(enemyId)) return false;
+            const Kingdom& enemy = kingdoms_.at(enemyId);
+            if (!enemy.isAlive) return false;
+            if (actorKingdom.policy == NationalPolicy::FinalWar ||
+                actorKingdom.strategyPlan == StrategyPlan::TotalConquest ||
+                enemy.policy == NationalPolicy::FinalWar) {
+                return false;
+            }
+
+            const DiplomaticRelation* rel = relationBetween(actorKingdom.id, enemyId);
+            if (!rel || rel->state != RelationState::War || rel->turnsAtWar <= 25) return false;
+
+            const int captured = capturedCitiesFrom(actorKingdom.id, enemyId);
+            const int lost = capturedCitiesFrom(enemyId, actorKingdom.id);
+            const float ourPower = kingdomFieldPower(actorKingdom.id) +
+                static_cast<float>(actorKingdom.cities.size()) * 220.0f;
+            const float enemyPower = kingdomFieldPower(enemyId) +
+                static_cast<float>(enemy.cities.size()) * 220.0f;
+            const float powerRatio = ourPower / std::max(1.0f, enemyPower);
+
+            float peaceNeed = 0.72f;
+            if (actorKingdom.personality == KingdomPersonality::Economic ||
+                actorKingdom.personality == KingdomPersonality::Diplomatic) {
+                peaceNeed = 0.42f;
+            } else if (actorKingdom.personality == KingdomPersonality::Defensive) {
+                peaceNeed = 0.50f;
+            } else if (actorKingdom.personality == KingdomPersonality::Opportunistic) {
+                peaceNeed = 0.56f;
+            } else if (actorKingdom.personality == KingdomPersonality::Aggressive ||
+                       actorKingdom.personality == KingdomPersonality::Expansionist) {
+                peaceNeed = 0.76f;
+            }
+
+            const bool limitedGainAchieved =
+                captured >= 2 ||
+                (captured >= 1 &&
+                 (actorKingdom.strategyPlan == StrategyPlan::BorderExpansion ||
+                  actorKingdom.strategyPlan == StrategyPlan::OpportunisticRaid));
+            bool warGoalAchieved = false;
+            if (actorKingdom.currentWarGoal.active() &&
+                actorKingdom.currentWarGoal.enemy == enemyId &&
+                actorKingdom.currentWarGoal.allowPeaceAfterGoal) {
+                int heldTargets = 0;
+                for (CityID cid : actorKingdom.currentWarGoal.targetCities) {
+                    if (cities_.count(cid) && cities_.at(cid).owner == actorKingdom.id) {
+                        ++heldTargets;
+                    }
+                }
+                warGoalAchieved =
+                    heldTargets >= actorKingdom.currentWarGoal.desiredCaptures ||
+                    (actorKingdom.currentWarGoal.type == WarGoalType::DefensiveHold &&
+                     rel->turnsAtWar >= actorKingdom.currentWarGoal.maxTurns &&
+                     lost == 0);
+            }
+            const bool revengeSatisfied =
+                actorKingdom.strategyPlan == StrategyPlan::RevengeWar &&
+                captured > lost;
+            const bool badWar =
+                lost > captured &&
+                (actorKingdom.warWeariness > 0.45f || powerRatio < 0.72f);
+            const bool longExhaustingWar =
+                rel->turnsAtWar > std::max<TurnNumber>(90, actorKingdom.currentWarGoal.maxTurns) &&
+                (actorKingdom.warWeariness > 0.45f || powerRatio < 0.90f);
+
+            if (warGoalAchieved &&
+                (actorKingdom.warWeariness > 0.28f ||
+                 actorKingdom.personality == KingdomPersonality::Economic ||
+                 actorKingdom.personality == KingdomPersonality::Diplomatic)) {
+                return true;
+            }
+            if ((limitedGainAchieved || revengeSatisfied) &&
+                actorKingdom.warWeariness >= peaceNeed) {
+                return true;
+            }
+            if (badWar || longExhaustingWar) return true;
+            return false;
+        };
+
+        if (warEnemy != NO_KINGDOM && shouldOfferObjectivePeace(k, warEnemy)) {
+            AIDecision peace;
+            peace.type = AIDecisionType::NegotiatePeace;
+            peace.actor = kid;
+            peace.target = warEnemy;
+            executeDecision(peace);
         }
 
         if (!underInvasion &&
@@ -2003,7 +2617,9 @@ void SimulationEngine::executeDecision(const AIDecision& d) {
             // joining another deep push and bouncing back a few turns later.
             for (ArmyID eid : ownArmies) {
                 Army& army = armies_.at(eid);
-                if (army.supplyLevel >= 0.52f) continue;
+                const float retreatSupply = actor.campaignPlan.active()
+                    ? actor.campaignPlan.retreatSupply : 0.52f;
+                if (army.supplyLevel >= retreatSupply) continue;
                 if (army.role == ArmyRole::Defense) continue;
                 bool activeSiege = false;
                 if (army.role == ArmyRole::Siege &&
@@ -2030,7 +2646,9 @@ void SimulationEngine::executeDecision(const AIDecision& d) {
             std::vector<ArmyID> attackArmies;
             for (ArmyID eid : ownArmies) {
                 const Army& army = armies_.at(eid);
-                if (army.supplyLevel < 0.52f && actor.policy != NationalPolicy::FinalWar) continue;
+                const float minAttackSupply = actor.campaignPlan.active()
+                    ? std::max(0.46f, actor.campaignPlan.retreatSupply + 0.10f) : 0.52f;
+                if (army.supplyLevel < minAttackSupply && actor.policy != NationalPolicy::FinalWar) continue;
                 ArmyRole role = armies_.at(eid).role;
                 if (role == ArmyRole::Attack || role == ArmyRole::Siege ||
                     actor.policy == NationalPolicy::FinalWar) {
@@ -2043,9 +2661,42 @@ void SimulationEngine::executeDecision(const AIDecision& d) {
                         armies_.at(eid).supplyLevel >= 0.58f) attackArmies.push_back(eid);
                 }
             }
+            if (actor.campaignPlan.active() &&
+                actor.campaignPlan.phase == CampaignPhase::Battle &&
+                attackArmies.size() < std::max<size_t>(2, ownArmies.size() / 2)) {
+                for (ArmyID eid : ownArmies) {
+                    if (std::find(attackArmies.begin(), attackArmies.end(), eid) != attackArmies.end()) continue;
+                    const Army& army = armies_.at(eid);
+                    if (army.role != ArmyRole::Reserve || army.supplyLevel < 0.64f) continue;
+                    attackArmies.push_back(eid);
+                    if (attackArmies.size() >= std::max<size_t>(2, ownArmies.size() / 2)) break;
+                }
+            }
             if (attackArmies.empty()) break;
 
             KingdomID enemyFilter = d.target != NO_KINGDOM ? d.target : actor.strategicTarget;
+            if (actor.currentWarGoal.active() &&
+                kingdoms_.count(actor.currentWarGoal.enemy) &&
+                kingdoms_.at(actor.currentWarGoal.enemy).isAlive &&
+                atWar(actor.id, actor.currentWarGoal.enemy)) {
+                enemyFilter = actor.currentWarGoal.enemy;
+            }
+
+            auto warGoalTargetRank = [&](CityID cid) {
+                if (!actor.currentWarGoal.active()) return -1;
+                for (size_t i = 0; i < actor.currentWarGoal.targetCities.size(); ++i) {
+                    if (actor.currentWarGoal.targetCities[i] == cid) return static_cast<int>(i);
+                }
+                return -1;
+            };
+            auto isAlliedWith = [&](KingdomID other) {
+                KingdomID lo = std::min(actor.id, other);
+                KingdomID hi = std::max(actor.id, other);
+                auto it = relations_.find(lo);
+                if (it == relations_.end()) return false;
+                auto it2 = it->second.find(hi);
+                return it2 != it->second.end() && it2->second.state == RelationState::Alliance;
+            };
 
             auto isSupplyHub = [](const City& city) {
                 return city.cityType == CityType::Fortress ||
@@ -2139,6 +2790,75 @@ void SimulationEngine::executeDecision(const AIDecision& d) {
                         std::remove_if(attackArmies.begin(), attackArmies.end(),
                             [&](ArmyID aid) {
                                 return std::find(assignedRear.begin(), assignedRear.end(), aid) != assignedRear.end();
+                            }),
+                        attackArmies.end());
+                    if (attackArmies.empty()) break;
+                }
+            }
+
+            if (actor.campaignPlan.active() && !actor.campaignPlan.fronts.empty()) {
+                std::vector<CampaignFront> defensiveFronts;
+                for (const CampaignFront& front : actor.campaignPlan.fronts) {
+                    if (front.defensive &&
+                        front.objective != NO_CITY &&
+                        cities_.count(front.objective) &&
+                        cities_.at(front.objective).owner == actor.id) {
+                        defensiveFronts.push_back(front);
+                    }
+                }
+                std::sort(defensiveFronts.begin(), defensiveFronts.end(),
+                          [](const CampaignFront& a, const CampaignFront& b) {
+                              return a.priority > b.priority;
+                          });
+
+                std::vector<ArmyID> assignedFrontDefense;
+                const size_t defenseLimit = std::min(
+                    defensiveFronts.size(),
+                    std::max<size_t>(1, ownArmies.size() / 4));
+                for (size_t fi = 0; fi < defenseLimit; ++fi) {
+                    const CampaignFront& front = defensiveFronts[fi];
+                    const TileID defendTile = cities_.at(front.objective).tile;
+                    std::vector<ArmyID> candidates;
+                    for (ArmyID eid : ownArmies) {
+                        if (std::find(assignedFrontDefense.begin(),
+                                      assignedFrontDefense.end(),
+                                      eid) != assignedFrontDefense.end()) {
+                            continue;
+                        }
+                        const Army& army = armies_.at(eid);
+                        if (army.role == ArmyRole::Siege) continue;
+                        if (army.supplyLevel < 0.34f) continue;
+                        if (army.role == ArmyRole::Defense ||
+                            army.role == ArmyRole::Reserve ||
+                            attackArmies.size() >= 4) {
+                            candidates.push_back(eid);
+                        }
+                    }
+                    if (candidates.empty()) continue;
+                    auto best = std::min_element(
+                        candidates.begin(), candidates.end(),
+                        [&](ArmyID a, ArmyID b) {
+                            return distanceBetween(armies_.at(a).currentTile, defendTile) <
+                                   distanceBetween(armies_.at(b).currentTile, defendTile);
+                        });
+                    if (best == candidates.end()) continue;
+
+                    ArmyID aid = *best;
+                    Army& army = armies_.at(aid);
+                    army.role = ArmyRole::Defense;
+                    army.targetTile = defendTile;
+                    army.movementPath.clear();
+                    army.pathCursor = 0;
+                    assignedFrontDefense.push_back(aid);
+                }
+
+                if (!assignedFrontDefense.empty()) {
+                    attackArmies.erase(
+                        std::remove_if(attackArmies.begin(), attackArmies.end(),
+                            [&](ArmyID aid) {
+                                return std::find(assignedFrontDefense.begin(),
+                                                 assignedFrontDefense.end(),
+                                                 aid) != assignedFrontDefense.end();
                             }),
                         attackArmies.end());
                     if (attackArmies.empty()) break;
@@ -2305,6 +3025,7 @@ void SimulationEngine::executeDecision(const AIDecision& d) {
                 TileID tile;
                 float score;
                 float supplyDistance;
+                float forceRatio;
             };
             std::vector<TargetCandidate> targets;
             for (const auto& [cid, city] : cities_) {
@@ -2321,14 +3042,49 @@ void SimulationEngine::executeDecision(const AIDecision& d) {
                 float basePenalty = std::max(0.0f, supplyBaseDist - 18.0f) * 4.0f;
                 float score = dist + supplyPenalty;
                 score += basePenalty;
+                const int goalRank = warGoalTargetRank(cid);
+                if (goalRank >= 0) {
+                    score -= 55.0f - static_cast<float>(goalRank) * 8.0f;
+                } else if (actor.currentWarGoal.active() &&
+                           actor.currentWarGoal.type != WarGoalType::TotalConquest) {
+                    score += 18.0f;
+                }
+                if (actor.campaignPlan.active()) {
+                    if (cid == actor.campaignPlan.primaryObjective) score -= 34.0f;
+                    if (actor.campaignPlan.diversion &&
+                        cid == actor.campaignPlan.secondaryObjective) score -= 20.0f;
+                    if (actor.campaignPlan.phase == CampaignPhase::Siege &&
+                        city.cityType == CityType::Fortress) score -= 10.0f;
+                    for (const CampaignFront& front : actor.campaignPlan.fronts) {
+                        if (front.defensive || front.objective != cid) continue;
+                        score -= 28.0f + front.desiredShare * 35.0f;
+                        if (front.stagingCity != NO_CITY && cities_.count(front.stagingCity)) {
+                            const float frontDist =
+                                distanceBetween(cities_.at(front.stagingCity).tile, city.tile);
+                            score += std::max(0.0f, frontDist - 26.0f) * 0.8f;
+                        }
+                    }
+                }
 
                 const bool supplyHub =
                     city.cityType == CityType::Fortress ||
                     city.cityType == CityType::TradeHub ||
                     city.cityType == CityType::Port;
+                const bool localTown =
+                    !city.isCapital &&
+                    (city.cityType == CityType::Generic ||
+                     city.cityType == CityType::Agricultural);
                 if (city.cityType == CityType::Fortress) score -= 22.0f;
                 if (city.cityType == CityType::TradeHub) score -= 16.0f;
                 if (city.cityType == CityType::Port) score -= 14.0f;
+                if (localTown) {
+                    float townValue = 10.0f;
+                    townValue += std::min(12.0f, static_cast<float>(city.population) * 0.010f);
+                    if (city.cityType == CityType::Agricultural) townValue += 6.0f;
+                    if (supplyBaseDist <= 14.0f) townValue += 12.0f;
+                    else if (supplyBaseDist <= 24.0f) townValue += 7.0f;
+                    score -= townValue;
+                }
                 if (supplyHub && supplyBaseDist <= 26.0f) score -= 18.0f;
                 if (!supplyHub && supplyBaseDist > 24.0f) score += 20.0f;
                 const float interdictionPressure = interdictionPressureFor(cid);
@@ -2357,7 +3113,157 @@ void SimulationEngine::executeDecision(const AIDecision& d) {
                 score += enemyFieldPressure;
                 score -= std::min(18.0f, exhaustedEnemyOpportunity);
 
-                targets.push_back({cid, city.tile, score, supplyBaseDist});
+                auto armyAssaultPower = [&](ArmyID aid) {
+                    const Army& army = armies_.at(aid);
+                    float roleFactor = 1.0f;
+                    if (army.role == ArmyRole::Siege) roleFactor = 1.18f;
+                    else if (army.role == ArmyRole::Attack) roleFactor = 1.08f;
+                    else if (army.role == ArmyRole::Reserve) roleFactor = 0.82f;
+                    else if (army.role == ArmyRole::Defense) roleFactor = 0.60f;
+
+                    const float supplyFactor = std::clamp(army.supplyLevel, 0.20f, 1.12f);
+                    const float targetDist = distanceBetween(army.currentTile, city.tile);
+                    const float arrivalFactor = targetDist <= 10.0f ? 1.0f :
+                        targetDist <= 20.0f ? 0.82f :
+                        targetDist <= 32.0f ? 0.58f : 0.32f;
+                    return static_cast<float>(army.totalSoldiers()) *
+                        supplyFactor * roleFactor * arrivalFactor;
+                };
+
+                float localAttackPower = 0.0f;
+                for (ArmyID aid : attackArmies) {
+                    if (!armies_.count(aid)) continue;
+                    localAttackPower += armyAssaultPower(aid);
+                }
+                float alliedSupportPower = 0.0f;
+                for (const auto& [allyAid, allyArmy] : armies_) {
+                    if (allyArmy.owner == actor.id) continue;
+                    if (!isAlliedWith(allyArmy.owner)) continue;
+                    if (!kingdoms_.count(allyArmy.owner) || !kingdoms_.at(allyArmy.owner).isAlive) continue;
+                    if (!atWar(allyArmy.owner, city.owner)) continue;
+                    if (allyArmy.currentTile == NO_TILE ||
+                        allyArmy.currentTile >= static_cast<TileID>(worldMap_.tileCount())) continue;
+                    float allyDist = distanceBetween(allyArmy.currentTile, city.tile);
+                    if (allyDist > 24.0f) continue;
+                    const float supportFactor = allyDist <= 10.0f ? 0.62f :
+                        allyDist <= 18.0f ? 0.42f : 0.24f;
+                    alliedSupportPower += static_cast<float>(allyArmy.totalSoldiers()) *
+                        std::clamp(allyArmy.supplyLevel, 0.25f, 1.05f) * supportFactor;
+                }
+                localAttackPower += alliedSupportPower;
+                if (alliedSupportPower > 0.0f) score -= std::min(18.0f, alliedSupportPower * 0.006f);
+
+                float localDefensePower = 80.0f +
+                    static_cast<float>(city.population) * 0.18f +
+                    city.fortification * 260.0f;
+                if (city.isCapital) localDefensePower += 420.0f;
+                if (city.cityType == CityType::Fortress) localDefensePower += 360.0f;
+                if (city.cityType == CityType::TradeHub ||
+                    city.cityType == CityType::Port) localDefensePower += 160.0f;
+
+                for (const auto& [enemyAid, enemyArmy] : armies_) {
+                    if (enemyArmy.owner != city.owner) continue;
+                    if (enemyArmy.currentTile == NO_TILE ||
+                        enemyArmy.currentTile >= static_cast<TileID>(worldMap_.tileCount())) continue;
+                    const float armyDist = distanceBetween(enemyArmy.currentTile, city.tile);
+                    if (armyDist > 18.0f) continue;
+                    const float reactionFactor = armyDist <= 8.0f ? 1.0f :
+                        armyDist <= 14.0f ? 0.70f : 0.45f;
+                    localDefensePower += static_cast<float>(enemyArmy.totalSoldiers()) *
+                        std::clamp(enemyArmy.supplyLevel, 0.25f, 1.10f) * reactionFactor;
+                }
+
+                const float forceRatio =
+                    localAttackPower / std::max(120.0f, localDefensePower);
+                if (localTown && forceRatio >= 1.0f) {
+                    score -= 8.0f;
+                }
+                float requiredRatio = 0.80f;
+                if (actor.personality == KingdomPersonality::Aggressive ||
+                    actor.personality == KingdomPersonality::Expansionist) {
+                    requiredRatio = 0.70f;
+                } else if (actor.personality == KingdomPersonality::Defensive ||
+                           actor.personality == KingdomPersonality::Economic) {
+                    requiredRatio = 0.92f;
+                } else if (actor.personality == KingdomPersonality::Opportunistic) {
+                    requiredRatio = 0.66f;
+                }
+                if (actor.currentWarGoal.active()) {
+                    requiredRatio = (requiredRatio + actor.currentWarGoal.requiredForceRatio) * 0.5f;
+                }
+                if (actor.campaignPlan.active()) {
+                    requiredRatio = (requiredRatio + actor.campaignPlan.commitThreshold) * 0.5f;
+                    if (actor.campaignPlan.supportAlly && alliedSupportPower > 0.0f) {
+                        requiredRatio -= 0.06f;
+                    }
+                }
+                if (actor.policy == NationalPolicy::FinalWar) requiredRatio *= 0.82f;
+
+                if (forceRatio < requiredRatio) {
+                    score += (requiredRatio - forceRatio) * 95.0f;
+                    if (city.isCapital || city.cityType == CityType::Fortress) score += 26.0f;
+                } else if (forceRatio > requiredRatio * 1.65f) {
+                    score -= std::min(20.0f, (forceRatio - requiredRatio) * 10.0f);
+                }
+
+                targets.push_back({cid, city.tile, score, supplyBaseDist, forceRatio});
+            }
+
+            for (const Tile& pointTile : worldMap_.tiles()) {
+                if (pointTile.strategicPoint == StrategicPointType::None) continue;
+                if (pointTile.city != NO_CITY) continue;
+                if (pointTile.terrain == TerrainType::Ocean ||
+                    pointTile.terrain == TerrainType::Lake) continue;
+                if (pointTile.owner == actor.id) continue;
+                if (enemyFilter != NO_KINGDOM &&
+                    pointTile.owner != enemyFilter &&
+                    pointTile.owner != NO_KINGDOM) {
+                    continue;
+                }
+                if (pointTile.owner != NO_KINGDOM &&
+                    !atWar(actor.id, pointTile.owner)) {
+                    continue;
+                }
+
+                const auto pointPos = pointTile.position;
+                const float dist = std::hypot(float(leadPos.x - pointPos.x),
+                                              float(leadPos.y - pointPos.y));
+                const float supplyPenalty = std::max(0.0f, dist - safeRange) * 2.2f;
+                const float supplyBaseDist = nearestOwnedCityDistanceTo(actor.id, pointTile.id);
+                const float basePenalty = std::max(0.0f, supplyBaseDist - 18.0f) * 3.4f;
+                float value = pointTile.strategicValue;
+                switch (pointTile.strategicPoint) {
+                    case StrategicPointType::MountainPass: value += 16.0f; break;
+                    case StrategicPointType::Bridge:       value += 14.0f; break;
+                    case StrategicPointType::RiverFord:    value += 10.0f; break;
+                    case StrategicPointType::HarborSite:   value += 13.0f; break;
+                    case StrategicPointType::SupplyDepot:  value += 18.0f; break;
+                    case StrategicPointType::None: break;
+                }
+                if (supplyBaseDist <= 12.0f) value += 16.0f;
+                else if (supplyBaseDist <= 22.0f) value += 9.0f;
+                if (pointTile.owner == NO_KINGDOM) value += 7.0f;
+
+                float enemyPressure = 0.0f;
+                for (const auto& [enemyAid, enemyArmy] : armies_) {
+                    (void)enemyAid;
+                    if (enemyArmy.owner == actor.id) continue;
+                    if (pointTile.owner != NO_KINGDOM && enemyArmy.owner != pointTile.owner) continue;
+                    if (enemyArmy.currentTile == NO_TILE ||
+                        enemyArmy.currentTile >= static_cast<TileID>(worldMap_.tileCount())) continue;
+                    float armyDist = distanceBetween(enemyArmy.currentTile, pointTile.id);
+                    if (armyDist > 12.0f) continue;
+                    enemyPressure += static_cast<float>(enemyArmy.totalSoldiers()) *
+                        std::clamp(enemyArmy.supplyLevel, 0.25f, 1.0f) *
+                        (armyDist <= 5.0f ? 0.004f : 0.002f);
+                }
+
+                float score = dist + supplyPenalty + basePenalty - value + enemyPressure;
+                const float forceRatio = enemyPressure > 0.0f
+                    ? static_cast<float>(attackArmies.size()) * 650.0f / std::max(120.0f, enemyPressure * 110.0f)
+                    : 1.25f;
+                if (forceRatio < 0.75f) score += 32.0f;
+                targets.push_back({NO_CITY, pointTile.id, score, supplyBaseDist, forceRatio});
             }
             std::sort(targets.begin(), targets.end(),
                       [](const TargetCandidate& a, const TargetCandidate& b) {
@@ -2380,7 +3286,7 @@ void SimulationEngine::executeDecision(const AIDecision& d) {
                     const float supplyBaseDist =
                         nearestOwnedCityDistanceTo(actor.id, cities_.at(d.targetCity).tile);
                     targets.push_back({d.targetCity, cities_.at(d.targetCity).tile,
-                                       supplyBaseDist, supplyBaseDist});
+                                       supplyBaseDist, supplyBaseDist, 1.0f});
                 } else {
                     break;
                 }
@@ -2396,6 +3302,42 @@ void SimulationEngine::executeDecision(const AIDecision& d) {
                                          attackArmies.size() >= 3 ? 2u : 1u;
             const size_t frontCount = std::min(desiredFronts, targets.size());
 
+            struct FrontTargetChoice {
+                size_t targetIndex = 0;
+                float desiredShare = 0.0f;
+                bool primary = false;
+            };
+            std::vector<FrontTargetChoice> frontTargetChoices;
+            if (actor.campaignPlan.active() && !actor.campaignPlan.fronts.empty()) {
+                for (const CampaignFront& front : actor.campaignPlan.fronts) {
+                    if (front.defensive || front.objective == NO_CITY) continue;
+                    for (size_t ti = 0; ti < targets.size(); ++ti) {
+                        if (targets[ti].city != front.objective) continue;
+                        const bool primary = front.objective == actor.campaignPlan.primaryObjective;
+                        frontTargetChoices.push_back({
+                            ti,
+                            std::max(0.08f, front.desiredShare),
+                            primary
+                        });
+                        break;
+                    }
+                }
+                std::sort(frontTargetChoices.begin(), frontTargetChoices.end(),
+                          [](const FrontTargetChoice& a, const FrontTargetChoice& b) {
+                              if (a.primary != b.primary) return a.primary;
+                              return a.desiredShare > b.desiredShare;
+                          });
+                float shareTotal = 0.0f;
+                for (const FrontTargetChoice& choice : frontTargetChoices) {
+                    shareTotal += choice.desiredShare;
+                }
+                if (shareTotal > 0.0f) {
+                    for (FrontTargetChoice& choice : frontTargetChoices) {
+                        choice.desiredShare /= shareTotal;
+                    }
+                }
+            }
+
             std::sort(attackArmies.begin(), attackArmies.end(), [&](ArmyID a, ArmyID b) {
                 return distanceBetween(armies_.at(a).currentTile, targets.front().tile) <
                        distanceBetween(armies_.at(b).currentTile, targets.front().tile);
@@ -2410,13 +3352,58 @@ void SimulationEngine::executeDecision(const AIDecision& d) {
             }
 
             size_t mobileIndex = 0;
+            auto choosePlannedFrontTarget = [&](size_t slot, size_t total, bool siege) {
+                if (frontTargetChoices.empty()) return size_t{0};
+                if (siege) {
+                    auto primary = std::find_if(
+                        frontTargetChoices.begin(), frontTargetChoices.end(),
+                        [](const FrontTargetChoice& choice) { return choice.primary; });
+                    return primary != frontTargetChoices.end()
+                        ? primary->targetIndex
+                        : frontTargetChoices.front().targetIndex;
+                }
+                const float position = (static_cast<float>(slot) + 0.5f) /
+                    static_cast<float>(std::max<size_t>(1, total));
+                float cursor = 0.0f;
+                for (const FrontTargetChoice& choice : frontTargetChoices) {
+                    cursor += choice.desiredShare;
+                    if (position <= cursor) return choice.targetIndex;
+                }
+                return frontTargetChoices.back().targetIndex;
+            };
+
             for (size_t i = 0; i < attackArmies.size(); ++i) {
                 ArmyID eid = attackArmies[i];
                 const bool siege = armies_.at(eid).role == ArmyRole::Siege ||
                     (!assignedCityAssault && i == 0);
-                const TargetCandidate& target = siege
-                    ? targets.front()
-                    : targets[mobileIndex++ % frontCount];
+                size_t targetIndex = siege ? 0u : mobileIndex++ % frontCount;
+                if (!frontTargetChoices.empty() &&
+                    (attackArmies.size() >= 3 || siege)) {
+                    targetIndex = choosePlannedFrontTarget(i, attackArmies.size(), siege);
+                } else if (!siege &&
+                    actor.campaignPlan.active() &&
+                    actor.campaignPlan.diversion &&
+                    actor.campaignPlan.secondaryObjective != NO_CITY &&
+                    attackArmies.size() >= 4 &&
+                    i >= attackArmies.size() / 2) {
+                    for (size_t ti = 0; ti < targets.size(); ++ti) {
+                        if (targets[ti].city == actor.campaignPlan.secondaryObjective) {
+                            targetIndex = ti;
+                            break;
+                        }
+                    }
+                }
+                if (siege &&
+                    actor.campaignPlan.active() &&
+                    actor.campaignPlan.primaryObjective != NO_CITY) {
+                    for (size_t ti = 0; ti < targets.size(); ++ti) {
+                        if (targets[ti].city == actor.campaignPlan.primaryObjective) {
+                            targetIndex = ti;
+                            break;
+                        }
+                    }
+                }
+                const TargetCandidate& target = targets[targetIndex];
 
                 std::vector<TileID> stagingTargets{target.tile};
                 for (TileID nid : worldMap_.neighbors8(target.tile)) {
@@ -2427,6 +3414,29 @@ void SimulationEngine::executeDecision(const AIDecision& d) {
                 TileID assignedTarget = siege
                     ? target.tile
                     : stagingTargets[(mobileIndex + i) % stagingTargets.size()];
+
+                float assaultThreshold = 0.72f;
+                if (actor.personality == KingdomPersonality::Defensive ||
+                    actor.personality == KingdomPersonality::Economic) {
+                    assaultThreshold = 0.88f;
+                } else if (actor.personality == KingdomPersonality::Opportunistic) {
+                    assaultThreshold = 0.64f;
+                }
+                if (actor.currentWarGoal.active()) {
+                    assaultThreshold =
+                        (assaultThreshold + actor.currentWarGoal.requiredForceRatio) * 0.5f;
+                }
+                if (actor.campaignPlan.active()) {
+                    assaultThreshold =
+                        (assaultThreshold + actor.campaignPlan.commitThreshold) * 0.5f;
+                }
+                if (actor.policy == NationalPolicy::FinalWar) assaultThreshold *= 0.82f;
+                if (!frontlineBases.empty() &&
+                    target.forceRatio < assaultThreshold &&
+                    distanceBetween(armies_.at(eid).currentTile, target.tile) > 5.0f) {
+                    TileID frontline = bestFrontlineFor(target.tile);
+                    if (frontline != NO_TILE) assignedTarget = frontline;
+                }
 
                 if (siege && !frontlineBases.empty() && attackArmies.size() >= 2) {
                     float nearestSupport = 1e9f;
@@ -2526,8 +3536,8 @@ void SimulationEngine::executeDecision(const AIDecision& d) {
                 (actor.strategyPlan == StrategyPlan::OpportunisticRaid ||
                  actor.strategyPlan == StrategyPlan::RevengeWar ||
                  actor.strategyPlan == StrategyPlan::TotalConquest) ? 1 : 0;
-            // Diplomatic kingdoms are limited to 2 armies (no military culture)
-            const int hardCap = (actor.personality == KingdomPersonality::Diplomatic) ? 2 : 8;
+            // Diplomatic kingdoms: limited military culture but can defend themselves (cap 5)
+            const int hardCap = (actor.personality == KingdomPersonality::Diplomatic) ? 5 : 8;
             int maxArmies = std::clamp(static_cast<int>(actor.cities.size()) + 1 + bonusArmies, 3, hardCap);
             if (livingArmies >= maxArmies) {
                 // At cap — reinforce cheaply if we can afford it
@@ -2738,6 +3748,8 @@ void SimulationEngine::executeDecision(const AIDecision& d) {
 }
 
 void SimulationEngine::collectSnapshot() {
+    if (!serializer_) return;
+
     SimulationSnapshot snap;
     snap.turn = currentTurn_;
 
@@ -2777,8 +3789,7 @@ void SimulationEngine::collectSnapshot() {
             snap.relations.push_back(rel);
         }
     }
-
-    if (serializer_) serializer_->serialize(snap);
+    serializer_->serialize(snap);
 }
 
 void SimulationEngine::printTurnSummary() const {
@@ -3050,26 +4061,27 @@ bool SimulationEngine::canFoundCity(const Kingdom& k, TileID tile) const {
     if (tile == NO_TILE || tile >= static_cast<TileID>(worldMap_.tileCount())) return false;
     const auto& t = worldMap_.at(tile);
 
-    // Expansionist/Opportunistic: settler culture — can found on unclaimed or own territory
+    // Expansionist/Opportunistic: settler doctrine — plant colonies anywhere habitable
+    // (NationGenerator owns all land so "unclaimed" check is useless; just allow any land)
     const bool isSettler = (k.personality == KingdomPersonality::Expansionist ||
                             k.personality == KingdomPersonality::Opportunistic);
-    if (isSettler) {
-        // Allow own territory OR unclaimed land (frontier expansion)
-        if (t.owner != k.id && t.owner != NO_KINGDOM) return false;
-    } else {
+    if (!isSettler) {
         if (t.owner != k.id) return false;
     }
 
     if (t.city  != NO_CITY) return false;
-    if (t.terrain == TerrainType::Ocean    ||
-        t.terrain == TerrainType::Lake     ||
-        t.terrain == TerrainType::Mountain ||
-        t.terrain == TerrainType::Coast)   return false;
-    // Must be at least 16 tiles from any existing city
+    if (t.terrain == TerrainType::Ocean ||
+        t.terrain == TerrainType::Lake  ||
+        t.terrain == TerrainType::Coast) return false;
+    if (t.terrain == TerrainType::Mountain && !isSettler) return false;
+    // Minimum founding distance: Expansionist uses dense colonial network (4 tiles),
+    // others use normal spacing (16 tiles)
+    const float minDist = (k.personality == KingdomPersonality::Expansionist ||
+                           k.personality == KingdomPersonality::Opportunistic) ? 4.0f : 16.0f;
     for (const auto& [cid, city] : cities_) {
         float d = std::hypot(float(t.position.x - city.position.x),
                              float(t.position.y - city.position.y));
-        if (d < 16.0f) return false;
+        if (d < minDist) return false;
     }
     return true;
 }
@@ -3079,9 +4091,7 @@ void SimulationEngine::runAICityBuilding() {
 
     for (auto& [kid, k] : kingdoms_) {
         if (!k.isAlive) continue;
-        // Diplomatic kingdoms don't found cities — they grow through alliances and diplomacy
-        // Their path to victory is CONQUEST and inheritance, not settler expansion
-        if (k.personality == KingdomPersonality::Diplomatic) continue;
+        // Diplomatic kingdoms use slow civic expansion (60-turn cooldown, high cost, no hard cap)
         const bool isExpansionist  = (k.personality == KingdomPersonality::Expansionist);
         const bool isOpportunistic = (k.personality == KingdomPersonality::Opportunistic);
         // Expansionist/Opportunistic: can found starting from their 1 capital; others need 3
@@ -3099,14 +4109,86 @@ void SimulationEngine::runAICityBuilding() {
         if (!isExpansionist && !isOpportunistic && k.treasury.stone < stoneCost) continue;
         if (k.stability < 0.40f) continue;  // slightly more tolerant of instability
 
+        auto nearCoast = [&](TileID tileId) {
+            if (tileId == NO_TILE || tileId >= static_cast<TileID>(worldMap_.tileCount())) return false;
+            const Tile& tile = worldMap_.at(tileId);
+            if (tile.terrain == TerrainType::Coast) return true;
+            for (TileID nid : worldMap_.neighbors4v(tileId)) {
+                const TerrainType terrain = worldMap_.at(nid).terrain;
+                if (terrain == TerrainType::Coast || terrain == TerrainType::Ocean) return true;
+            }
+            return false;
+        };
+
+        auto nearestEnemyCityDistance = [&](TileID tileId) {
+            float best = 1e9f;
+            const auto pos = worldMap_.at(tileId).position;
+            for (const auto& [cid, city] : cities_) {
+                if (city.owner == kid || city.owner == NO_KINGDOM) continue;
+                if (!kingdoms_.count(city.owner) || !kingdoms_.at(city.owner).isAlive) continue;
+                const auto cityPos = worldMap_.at(city.tile).position;
+                best = std::min(best, std::hypot(float(pos.x - cityPos.x), float(pos.y - cityPos.y)));
+            }
+            return best;
+        };
+
+        auto applyFoundedCityType = [&](City& city, const Tile& tile) {
+            const bool coastal = nearCoast(city.tile);
+            const bool highResource = tile.resourceRichness > 0.75f;
+            const bool onRiver = tile.hasRiver || tile.terrain == TerrainType::River;
+            const bool hillOrMountain =
+                tile.terrain == TerrainType::Hill ||
+                tile.terrain == TerrainType::Mountain;
+            const bool fertile = tile.fertility > 0.75f || onRiver;
+
+            if (hillOrMountain && city.fortification >= 0.24f) {
+                city.cityType = CityType::Fortress;
+                city.fortification = std::min(1.0f, city.fortification + 0.24f);
+                city.baseProduction.stone *= 1.5f;
+                city.baseProduction.iron *= 1.25f;
+                city.buildings.push_back({BuildingType::Walls, 1, 1.0f});
+            } else if (coastal) {
+                city.cityType = CityType::Port;
+                city.baseProduction.gold *= 1.55f;
+                city.baseProduction.food *= 0.90f;
+                city.buildings.push_back({BuildingType::Market, 1, 1.0f});
+            } else if (highResource) {
+                city.cityType = CityType::Mining;
+                city.baseProduction.iron *= 2.0f;
+                city.baseProduction.stone *= 1.7f;
+                city.buildings.push_back({BuildingType::IronMine, 1, 1.0f});
+            } else if (fertile) {
+                city.cityType = CityType::Agricultural;
+                city.baseProduction.food *= 1.65f;
+                city.population = static_cast<uint32_t>(city.population * 1.12f);
+                city.buildings.push_back({BuildingType::Granary, 1, 1.0f});
+            } else if (k.cities.size() >= 6) {
+                city.cityType = CityType::TradeHub;
+                city.baseProduction.gold *= 1.25f;
+                city.happiness = std::min(1.0f, city.happiness + 0.03f);
+                city.buildings.push_back({BuildingType::Market, 1, 1.0f});
+            }
+        };
+
         // Find best buildable tile
         TileID best = NO_TILE;
         float  bestScore = 0.0f;
         for (const auto& t : worldMap_.tiles()) {
             if (!canFoundCity(k, t.id)) continue;
-            float score = t.fertility * 1.5f + t.resourceRichness;
-            if (t.hasRiver) score += 1.0f;
-            if (t.terrain == TerrainType::Hill)   score += 0.5f;
+            const bool coastal = nearCoast(t.id);
+            const bool hillOrMountain =
+                t.terrain == TerrainType::Hill ||
+                t.terrain == TerrainType::Mountain;
+            const float enemyDist = nearestEnemyCityDistance(t.id);
+            float score = t.fertility * 1.25f + t.resourceRichness * 1.15f;
+            if (t.hasRiver || t.terrain == TerrainType::River) score += 1.2f;
+            if (t.terrain == TerrainType::Hill) score += 1.1f;
+            if (t.terrain == TerrainType::Mountain) score += 1.5f;
+            if (coastal) score += 0.9f;
+            if (t.resourceRichness > 0.75f) score += 0.8f;
+            if (hillOrMountain && (isExpansionist || isOpportunistic)) score += 0.7f;
+            if (enemyDist < 36.0f) score += std::max(0.0f, 36.0f - enemyDist) * 0.035f;
+            if (enemyDist < 12.0f && !isExpansionist && !isOpportunistic) score -= 1.2f;
             if (score > bestScore) { bestScore = score; best = t.id; }
         }
         // Expansionist/Opportunistic settle more easily (lower quality standards)
@@ -3139,12 +4221,14 @@ void SimulationEngine::runAICityBuilding() {
         city.baseProduction.iron  = tile.resourceRichness * 3.0f;
         city.happiness     = 0.70f;
         // Expansionist/Opportunistic build sturdier frontier outposts
-        city.fortification = (isExpansionist || isOpportunistic) ? 0.22f : 0.08f;
+        city.fortification = (isExpansionist || isOpportunistic) ? 0.26f : 0.12f;
         city.buildings.push_back({BuildingType::Farm, 1, 1.0f});
+        applyFoundedCityType(city, tile);
 
         CityID cid = nextCityID_++;
         city.id = cid;
-        worldMap_.at(best).city = cid;
+        worldMap_.at(best).city  = cid;
+        worldMap_.at(best).owner = kid;   // settler claims the tile on founding
         k.cities.push_back(cid);
         k.totalPopulation += city.population;
         cities_[cid] = std::move(city);

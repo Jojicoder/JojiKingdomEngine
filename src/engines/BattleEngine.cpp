@@ -682,6 +682,17 @@ void BattleEngine::applyResult(
     battleEv.context["defender_strength"] = result.defenderStrength;
 
     bus.emit(std::move(battleEv));
+
+    if (kingdoms.count(result.loser)) {
+        Kingdom& loser = kingdoms.at(result.loser);
+        loser.recentDefeats = std::min(6, loser.recentDefeats + 1);
+        loser.lastDefeatTurn = turn;
+        loser.lastDefeatedBy = result.victor;
+    }
+    if (kingdoms.count(result.victor)) {
+        Kingdom& victor = kingdoms.at(result.victor);
+        victor.recentDefeats = std::max(0, victor.recentDefeats - 1);
+    }
 }
 
 bool BattleEngine::areAtWar(

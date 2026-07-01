@@ -130,6 +130,22 @@ void MilitaryEngine::decaySupply(
                 if (distSq < 64.0f) break;  // < 8 tiles away — close enough
             }
         }
+        for (const Tile& supplyTile : worldMap.tiles()) {
+            if (supplyTile.owner != army.owner) continue;
+            if (supplyTile.strategicPoint != StrategicPointType::SupplyDepot &&
+                supplyTile.strategicPoint != StrategicPointType::HarborSite &&
+                supplyTile.strategicPoint != StrategicPointType::Bridge) {
+                continue;
+            }
+            float dx = float(armyPos.x - supplyTile.position.x);
+            float dy = float(armyPos.y - supplyTile.position.y);
+            float distSq = dx*dx + dy*dy;
+            if (distSq < nearestDistSq) {
+                nearestDistSq = distSq;
+                nearestIsPort = supplyTile.strategicPoint == StrategicPointType::HarborSite;
+                if (distSq < 49.0f) break;
+            }
+        }
         float nearestCity = std::sqrt(nearestDistSq);
         // Port cities extend effective supply range by 8 tiles (coastal logistics)
         float effectiveRange = nearestCity;
@@ -154,6 +170,12 @@ void MilitaryEngine::decaySupply(
         if (t.terrain == TerrainType::River || t.hasRiver) delta += 0.018f;
         if (t.terrain == TerrainType::Mountain)             delta -= 0.025f;
         if (t.terrain == TerrainType::Hill)                 delta -= 0.010f;
+        if (t.owner == army.owner) {
+            if (t.strategicPoint == StrategicPointType::SupplyDepot) delta += 0.030f;
+            if (t.strategicPoint == StrategicPointType::HarborSite)  delta += 0.024f;
+            if (t.strategicPoint == StrategicPointType::Bridge ||
+                t.strategicPoint == StrategicPointType::RiverFord)   delta += 0.014f;
+        }
 
         if (delta < 0.0f) {
             delta *= mods.supplyDecay;

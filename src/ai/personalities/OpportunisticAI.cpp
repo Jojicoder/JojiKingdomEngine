@@ -131,8 +131,8 @@ std::vector<AIDecision> OpportunisticAI::evaluate(const AIContext& ctx) const {
         decisions.push_back(d);
     }
 
-    // Priority 2: Attack vulnerable target
-    if (prey != NO_KINGDOM && bestVulnerability > 0.20f &&
+    // Priority 2: Attack vulnerable target (raised threshold: only strike clearly distracted foes)
+    if (prey != NO_KINGDOM && bestVulnerability > 0.45f &&
         self.treasury.gold > 50.0f && !self.armies.empty()) {
         if (!atWarWith(ctx, prey)) {
             AIDecision d;

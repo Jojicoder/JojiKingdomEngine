@@ -33,6 +33,7 @@ namespace jke {
 
 struct SimulationConfig {
     uint64_t    seed          = 42;
+    // 0 means unlimited turns; the simulation runs until unification or user exit.
     uint32_t    maxTurns      = 2000;
     std::string outputDir     = "output";
     bool        verbose       = false;
@@ -45,7 +46,7 @@ public:
 
     void setSerializer(std::unique_ptr<SnapshotSerializer> s);
 
-    // Run all turns until maxTurns or continent unified
+    // Run all turns until maxTurns or continent unified. maxTurns == 0 means no turn cap.
     void run();
 
     // Run exactly one turn; returns false when simulation is over

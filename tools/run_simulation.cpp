@@ -10,9 +10,10 @@ static void printHelp(const char* progName) {
     std::cout << "Usage: " << progName << " [options]\n"
               << "Options:\n"
               << "  --seed <N>       Random seed (default: 42)\n"
-              << "  --turns <N>      Max simulation turns (default: 300)\n"
+              << "  --turns <N>      Max simulation turns; 0 = unlimited until unification (default: 2000)\n"
               << "  --output <dir>   Output directory for JSON snapshots (default: output)\n"
               << "  --single         Write single output.json instead of per-turn files\n"
+              << "  --no-output      Run simulation without writing JSON snapshots\n"
               << "  --verbose        Print turn summaries to stdout\n"
               << "  --help           Show this help\n";
 }
@@ -20,6 +21,7 @@ static void printHelp(const char* progName) {
 int main(int argc, char** argv) {
     jke::SimulationConfig config;
     bool singleFile = false;
+    bool noOutput = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -34,6 +36,8 @@ int main(int argc, char** argv) {
             config.outputDir = argv[++i];
         } else if (arg == "--single") {
             singleFile = true;
+        } else if (arg == "--no-output") {
+            noOutput = true;
         } else if (arg == "--verbose" || arg == "-v") {
             config.verbose = true;
         } else {
@@ -44,11 +48,16 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "JojiKingdomEngine v1.0\n";
-    std::cout << "Seed: " << config.seed << "  Turns: " << config.maxTurns << "\n\n";
+    std::cout << "Seed: " << config.seed << "  Turns: ";
+    if (config.maxTurns == 0) std::cout << "unlimited";
+    else std::cout << config.maxTurns;
+    std::cout << "\n\n";
 
     jke::SimulationEngine engine(config);
 
-    if (singleFile) {
+    if (noOutput) {
+        std::cout << "Output: disabled\n";
+    } else if (singleFile) {
         std::string outPath = config.outputDir + "/simulation.json";
         std::filesystem::create_directories(config.outputDir);
         engine.setSerializer(

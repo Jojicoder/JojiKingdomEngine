@@ -190,12 +190,14 @@ public:
             if (!paused_ && !engine_.isOver()) {
                 accumulator += clock.restart().asSeconds();
                 float interval = 1.f / static_cast<float>(speed_);
+                bool advanced = false;
                 while (accumulator >= interval) {
                     accumulator -= interval;
                     engine_.step();
-                    rebuildMapImage();
+                    advanced = true;
                     if (engine_.isOver()) break;
                 }
+                if (advanced && shouldRefreshMapImage()) rebuildMapImage();
             } else {
                 clock.restart();
             }
@@ -285,9 +287,11 @@ private:
     std::vector<jke::KingdomID> previousDistrictOwner_;
     std::vector<uint8_t>        districtFlashTurns_;
     bool                        haveDistrictHistory_ = false;
+    uint64_t                    districtSignature_ = 0;
 
     // Minimap only rebuilt when turn advances
     jke::TurnNumber minimapTurn_ = ~0u;
+    jke::TurnNumber lastMapImageTurn_ = ~0u;
 
     // ── Event handling ────────────────────────────────────────────────────────
     void handleEvents() {
@@ -304,10 +308,10 @@ private:
                         paused_ = !paused_;
                         break;
                     case sf::Keyboard::Key::Up:
-                        speed_ = std::min(20, speed_ + 1);
+                        speed_ = std::min(240, speed_ + (speed_ >= 20 ? 10 : 1));
                         break;
                     case sf::Keyboard::Key::Down:
-                        speed_ = std::max(1, speed_ - 1);
+                        speed_ = std::max(1, speed_ - (speed_ > 20 ? 10 : 1));
                         break;
                     case sf::Keyboard::Key::Right:
                         if (paused_) { engine_.step(); rebuildMapImage(); }
@@ -449,10 +453,36 @@ private:
         const auto& cities = engine_.cities();
         const auto& kingdoms = engine_.kingdoms();
 
+        uint64_t signature = 1469598103934665603ull;
+        auto mix = [&](uint64_t v) {
+            signature ^= v;
+            signature *= 1099511628211ull;
+        };
+        mix(static_cast<uint64_t>(cities.size()));
+        for (const auto& [cid, city] : cities) {
+            mix(static_cast<uint64_t>(cid));
+            mix(static_cast<uint64_t>(city.owner + 0x9e3779b9u));
+            mix(static_cast<uint64_t>(city.isRuined));
+            mix(static_cast<uint64_t>(city.isCapital));
+        }
+        for (const auto& [kid, kingdom] : kingdoms) {
+            mix(static_cast<uint64_t>(kid));
+            mix(static_cast<uint64_t>(kingdom.isAlive));
+        }
+
         if (districtFlashTurns_.size() != tiles.size()) {
             districtFlashTurns_.assign(tiles.size(), 0);
             previousDistrictOwner_.clear();
             haveDistrictHistory_ = false;
+        }
+
+        if (signature == districtSignature_ &&
+            districtOwner_.size() == tiles.size() &&
+            districtCity_.size() == tiles.size()) {
+            for (auto& flash : districtFlashTurns_) {
+                if (flash > 0) --flash;
+            }
+            return;
         }
 
         districtOwner_.assign(tiles.size(), jke::NO_KINGDOM);
@@ -518,6 +548,7 @@ private:
             haveDistrictHistory_ = true;
         }
         previousDistrictOwner_ = districtOwner_;
+        districtSignature_ = signature;
     }
 
     static float districtControlRadiusTiles(const jke::City& city) {
@@ -547,6 +578,7 @@ private:
 
     void rebuildMapImage() {
         if (!terrainBuilt_) buildTerrainLayer();
+        lastMapImageTurn_ = engine_.currentTurn();
 
         const auto& tiles    = engine_.worldMap().tiles();
         const auto& cities   = engine_.cities();
@@ -781,6 +813,15 @@ private:
         }
     }
 
+    bool shouldRefreshMapImage() const {
+        if (lastMapImageTurn_ == ~0u) return true;
+        const jke::TurnNumber elapsed = engine_.currentTurn() - lastMapImageTurn_;
+        if (speed_ <= 20) return elapsed >= 1;
+        if (speed_ <= 80) return elapsed >= 2;
+        if (speed_ <= 160) return elapsed >= 4;
+        return elapsed >= 8;
+    }
+
     // ── Text helper ───────────────────────────────────────────────────────────
     void drawText(const std::string& str, float x, float y,
                   unsigned size = 13, sf::Color col = TEXT_COLOR) {
@@ -826,6 +867,7 @@ private:
 
     void drawMapOverlays() {
         drawMovementOverlays();
+        drawStrategicPointOverlays();
         drawCityOverlays();
         drawArmyOverlays();
         drawBanditOverlays();
@@ -1007,6 +1049,24 @@ private:
         }
         y += 14.f;
 
+        if (tile.strategicPoint != jke::StrategicPointType::None) {
+            sf::Color pointColor = sf::Color{180, 210, 235};
+            switch (tile.strategicPoint) {
+                case jke::StrategicPointType::MountainPass: pointColor = sf::Color{190, 150, 95}; break;
+                case jke::StrategicPointType::Bridge:       pointColor = sf::Color{110, 180, 230}; break;
+                case jke::StrategicPointType::RiverFord:    pointColor = sf::Color{105, 205, 210}; break;
+                case jke::StrategicPointType::HarborSite:   pointColor = sf::Color{70, 150, 245};  break;
+                case jke::StrategicPointType::SupplyDepot:  pointColor = sf::Color{220, 195, 90};  break;
+                case jke::StrategicPointType::None: break;
+            }
+            drawText("Point: " + std::string(jke::strategicPointName(tile.strategicPoint)),
+                     bx + 6.f, y, 10, pointColor);
+            y += 13.f;
+            drawText("Value " + std::to_string(static_cast<int>(tile.strategicValue)),
+                     bx + 6.f, y, 10, DIM_COLOR);
+            y += 13.f;
+        }
+
         // City
         if (tile.city != jke::NO_CITY && cities.count(tile.city)) {
             const auto& city = cities.at(tile.city);
@@ -1089,6 +1149,47 @@ private:
             endpoint.setOutlineColor(sf::Color{0, 0, 0, 180});
             endpoint.setOutlineThickness(1.f);
             window_.draw(endpoint);
+        }
+    }
+
+    void drawStrategicPointOverlays() {
+        const auto& kingdoms = engine_.kingdoms();
+        for (const jke::Tile& tile : engine_.worldMap().tiles()) {
+            if (tile.strategicPoint == jke::StrategicPointType::None ||
+                tile.city != jke::NO_CITY) {
+                continue;
+            }
+
+            sf::Vector2f pos = tileCenter(tile.id);
+            sf::Color base = sf::Color{200, 210, 220};
+            switch (tile.strategicPoint) {
+                case jke::StrategicPointType::MountainPass: base = sf::Color{190, 140, 80};  break;
+                case jke::StrategicPointType::Bridge:       base = sf::Color{120, 190, 240}; break;
+                case jke::StrategicPointType::RiverFord:    base = sf::Color{115, 220, 215}; break;
+                case jke::StrategicPointType::HarborSite:   base = sf::Color{70, 150, 245};  break;
+                case jke::StrategicPointType::SupplyDepot:  base = sf::Color{230, 200, 90};  break;
+                case jke::StrategicPointType::None: break;
+            }
+            if (tile.owner != jke::NO_KINGDOM && kingdoms.count(tile.owner)) {
+                base = blend(base, kingdomColor(tile.owner), 0.34f);
+            }
+
+            const float r = tile.strategicPoint == jke::StrategicPointType::SupplyDepot ? 4.8f : 4.2f;
+            sf::CircleShape glow(r + 2.2f, 4);
+            glow.setOrigin({r + 2.2f, r + 2.2f});
+            glow.setPosition(pos);
+            glow.setRotation(sf::degrees(45.f));
+            glow.setFillColor(sf::Color{0, 0, 0, 125});
+            window_.draw(glow);
+
+            sf::CircleShape marker(r, 4);
+            marker.setOrigin({r, r});
+            marker.setPosition(pos);
+            marker.setRotation(sf::degrees(45.f));
+            marker.setFillColor(base);
+            marker.setOutlineColor(sf::Color{12, 14, 18, 210});
+            marker.setOutlineThickness(1.2f);
+            window_.draw(marker);
         }
     }
 
@@ -1492,9 +1593,30 @@ private:
                 if (tile.city != jke::NO_CITY) targetCity = tile.city;
             }
         }
+        if (k.currentWarGoal.active()) {
+            for (jke::CityID cid : k.currentWarGoal.targetCities) {
+                if (engine_.cities().count(cid) &&
+                    engine_.cities().at(cid).owner != k.id) {
+                    targetCity = cid;
+                    break;
+                }
+            }
+        }
 
         std::string status;
-        if (k.strategyPlan == jke::StrategyPlan::RevengeWar &&
+        if (!k.aiReason.empty()) {
+            status = k.aiReason;
+        } else if (k.currentWarGoal.active() &&
+            engine_.kingdoms().count(k.currentWarGoal.enemy)) {
+            const auto& enemy = engine_.kingdoms().at(k.currentWarGoal.enemy);
+            if (targetCity != jke::NO_CITY && engine_.cities().count(targetCity)) {
+                status = k.name + " targets " + engine_.cities().at(targetCity).name;
+            } else {
+                status = k.name + " pursues " +
+                         std::string(jke::warGoalTypeName(k.currentWarGoal.type)) +
+                         " vs " + enemy.name;
+            }
+        } else if (k.strategyPlan == jke::StrategyPlan::RevengeWar &&
             k.strategicTarget != jke::NO_KINGDOM &&
             engine_.kingdoms().count(k.strategicTarget)) {
             status = k.name + " seeks revenge on " +
@@ -1524,7 +1646,7 @@ private:
 
         std::ostringstream roles;
         roles << "  A" << attack << " D" << defense << " S" << siege << " R" << reserve;
-        return ellipsize(status, 35) + roles.str();
+        return ellipsize(status, 48) + roles.str();
     }
 
     // ── Render ────────────────────────────────────────────────────────────────
@@ -1902,7 +2024,10 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "JojiKingdomEngine Viewer\n";
-    std::cout << "Seed: " << cfg.seed << "  MaxTurns: " << cfg.maxTurns << "\n";
+    std::cout << "Seed: " << cfg.seed << "  MaxTurns: ";
+    if (cfg.maxTurns == 0) std::cout << "unlimited";
+    else std::cout << cfg.maxTurns;
+    std::cout << "\n";
     std::cout << "Controls: Space=pause  Up/Down=speed  Right=step  Q=quit\n\n";
 
     Viewer viewer(cfg);

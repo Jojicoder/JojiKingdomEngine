@@ -45,6 +45,25 @@ enum class StrategyPlan : uint8_t {
     TotalConquest     = 7,
 };
 
+enum class WarGoalType : uint8_t {
+    None          = 0,
+    BorderCities  = 1,
+    SupplyHub     = 2,
+    Capital       = 3,
+    Punitive      = 4,
+    DefensiveHold = 5,
+    AntiHegemon   = 6,
+    TotalConquest = 7,
+};
+
+enum class CampaignPhase : uint8_t {
+    None      = 0,
+    Invasion  = 1,
+    Battle    = 2,
+    Siege     = 3,
+    Resupply  = 4,
+};
+
 constexpr std::string_view personalityName(KingdomPersonality p) noexcept {
     switch(p) {
         case KingdomPersonality::Aggressive:    return "Aggressive";
@@ -94,6 +113,76 @@ constexpr std::string_view strategyPlanName(StrategyPlan p) noexcept {
     return "Unknown";
 }
 
+constexpr std::string_view warGoalTypeName(WarGoalType g) noexcept {
+    switch(g) {
+        case WarGoalType::None:          return "None";
+        case WarGoalType::BorderCities:  return "Border Cities";
+        case WarGoalType::SupplyHub:     return "Supply Hub";
+        case WarGoalType::Capital:       return "Capital";
+        case WarGoalType::Punitive:      return "Punitive";
+        case WarGoalType::DefensiveHold: return "Defensive Hold";
+        case WarGoalType::AntiHegemon:   return "Anti-Hegemon";
+        case WarGoalType::TotalConquest: return "Total Conquest";
+    }
+    return "Unknown";
+}
+
+constexpr std::string_view campaignPhaseName(CampaignPhase p) noexcept {
+    switch(p) {
+        case CampaignPhase::None:     return "None";
+        case CampaignPhase::Invasion: return "Invasion";
+        case CampaignPhase::Battle:   return "Battle";
+        case CampaignPhase::Siege:    return "Siege";
+        case CampaignPhase::Resupply: return "Resupply";
+    }
+    return "Unknown";
+}
+
+struct WarGoal {
+    WarGoalType         type               = WarGoalType::None;
+    KingdomID           enemy              = NO_KINGDOM;
+    std::vector<CityID> targetCities;
+    TurnNumber          startedTurn        = 0;
+    TurnNumber          maxTurns           = 80;
+    int                 desiredCaptures    = 1;
+    float               requiredForceRatio = 0.80f;
+    bool                allowPeaceAfterGoal = true;
+
+    bool active() const noexcept {
+        return type != WarGoalType::None && enemy != NO_KINGDOM;
+    }
+};
+
+struct CampaignFront {
+    CityID    objective    = NO_CITY;
+    CityID    stagingCity  = NO_CITY;
+    KingdomID enemy        = NO_KINGDOM;
+    float     priority     = 0.0f;
+    float     threat       = 0.0f;
+    float     opportunity  = 0.0f;
+    float     desiredShare = 0.0f;
+    bool      defensive    = false;
+};
+
+struct CampaignPlan {
+    CampaignPhase phase               = CampaignPhase::None;
+    KingdomID     enemy               = NO_KINGDOM;
+    CityID        primaryObjective    = NO_CITY;
+    CityID        secondaryObjective  = NO_CITY;
+    CityID        stagingCity         = NO_CITY;
+    float         reserveRatio        = 0.20f;
+    float         retreatSupply       = 0.38f;
+    float         commitThreshold     = 0.85f;
+    bool          supportAlly         = false;
+    bool          diversion           = false;
+    std::vector<CampaignFront> fronts;
+    std::string   reason;
+
+    bool active() const noexcept {
+        return phase != CampaignPhase::None && enemy != NO_KINGDOM;
+    }
+};
+
 struct Kingdom {
     KingdomID              id               = NO_KINGDOM;
     std::string            name;
@@ -102,6 +191,8 @@ struct Kingdom {
     NationalPolicy         policy           = NationalPolicy::Rebuilding;
     StrategyPlan           strategyPlan     = StrategyPlan::HoldAndRecover;
     KingdomID              strategicTarget  = NO_KINGDOM;
+    WarGoal                currentWarGoal;
+    CampaignPlan           campaignPlan;
     KingdomID              revengeTarget    = NO_KINGDOM;
     TurnNumber             revengeUntil     = 0;
 
@@ -156,6 +247,12 @@ struct Kingdom {
 
     // War exhaustion: rises each turn at war, decays in peace
     float                  warWeariness     = 0.0f;  // 0.0 – 1.0
+
+    // Strategic memory: recent losses make future campaigns more cautious.
+    int                    recentDefeats    = 0;
+    TurnNumber             lastDefeatTurn   = 0;
+    KingdomID              lastDefeatedBy   = NO_KINGDOM;
+    std::string            aiReason;
 
     // Disease
     int                    plagueTurns      = 0;     // 0 = healthy, >0 = plague active
