@@ -1,3 +1,13 @@
+// OpportunisticAI — 機会主義型
+// 該当王国: Goldenveil（利があればどこにでも売る商人国家）, Ashford（廃墟から這い上がる抜け目ない民）,
+//           Mistwood（霧の森で機を窺う）, Duskfell（滅びかけた国が生き残るために機を突く）
+//
+// 戦略方針:
+//   - 弱った敵・補給切れの軍・戦争疲弊国を優先的に狙う
+//   - 補給線を断って敵軍を孤立させてから攻撃する（supply interdiction）
+//   - 自分から積極的に戦争を起こさず、漁夫の利を狙う
+//   - 情勢が不利なら即座に撤退・講和し、体力を温存する
+
 #include "jke/ai/personalities/OpportunisticAI.hpp"
 #include <algorithm>
 #include <cmath>
@@ -145,21 +155,7 @@ std::vector<AIDecision> OpportunisticAI::evaluate(const AIContext& ctx) const {
         } else {
             auto it = ctx.kingdoms.find(prey);
             if (it != ctx.kingdoms.end() && it->second.capitalCity != NO_CITY) {
-                CityID raidTarget = NO_CITY;
-                float bestCityScore = 1e9f;
-                for (const auto& [cid, city] : ctx.cities) {
-                    if (city.owner != prey || city.tile == NO_TILE) continue;
-                    if (city.isCapital && it->second.cities.size() > 1) continue;
-
-                    float score = city.fortification * 80.0f +
-                                  static_cast<float>(city.population) * 0.002f;
-                    if (!city.isCapital) score -= 18.0f;
-                    if (city.originalOwner != city.owner) score -= 12.0f;
-                    if (score < bestCityScore) {
-                        bestCityScore = score;
-                        raidTarget = cid;
-                    }
-                }
+                CityID raidTarget = findBestAttackCity(ctx, prey);
                 if (raidTarget == NO_CITY) raidTarget = it->second.capitalCity;
 
                 AIDecision d;

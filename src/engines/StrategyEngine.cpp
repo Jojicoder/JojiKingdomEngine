@@ -338,12 +338,133 @@ void SimulationEngine::updateStrategicPostures() {
 }
 
 void SimulationEngine::assignArmyRoles() {
+    auto isDefenseRole = [](ArmyRole role) {
+        return role == ArmyRole::Defense ||
+               role == ArmyRole::Garrison ||
+               role == ArmyRole::SupplyGuard;
+    };
+    auto vanguardScore = [](const Army& army) {
+        float score = static_cast<float>(army.totalSoldiers()) * 0.00022f;
+        if (army.hasCommander()) {
+            score += army.commander.attack * 1.6f;
+            score += army.commander.cavalry * 1.1f;
+            score += army.commander.pursuit * 1.0f;
+            score += army.commander.morale * 0.5f;
+        }
+        if (army.hasStrategist()) {
+            score += army.strategist.ambush * 0.5f;
+            score += army.strategist.logistics * 0.4f;
+        }
+        return score;
+    };
+    auto flankerScore = [](const Army& army) {
+        float score = static_cast<float>(army.totalSoldiers()) * 0.00018f;
+        if (army.hasCommander()) {
+            score += army.commander.cavalry * 1.5f;
+            score += army.commander.pursuit * 1.0f;
+            score += army.commander.attack * 0.7f;
+        }
+        if (army.hasStrategist()) {
+            score += army.strategist.ambush * 1.3f;
+            score += army.strategist.lure * 0.8f;
+            score += army.strategist.logistics * 0.4f;
+        }
+        return score;
+    };
+    auto defenseScore = [](const Army& army) {
+        float score = static_cast<float>(army.totalSoldiers()) * 0.00025f;
+        if (army.hasCommander()) {
+            score += army.commander.defense * 1.8f;
+            score += army.commander.morale * 0.9f;
+        }
+        if (army.hasStrategist()) {
+            score += army.strategist.retreat * 0.7f;
+            score += army.strategist.lure * 0.8f;
+        }
+        return score;
+    };
+    auto siegeScore = [](const Army& army) {
+        float score = static_cast<float>(army.totalSoldiers()) * 0.00016f;
+        for (const Unit& unit : army.units) {
+            if (unit.type == UnitType::SiegeUnit && unit.soldiers > 0) score += 3.0f;
+        }
+        if (army.hasStrategist()) {
+            score += army.strategist.siege * 2.2f;
+            score += army.strategist.logistics * 0.6f;
+        }
+        if (army.hasCommander()) score += army.commander.morale * 0.3f;
+        return score;
+    };
+    auto supplyScore = [](const Army& army) {
+        float score = static_cast<float>(army.totalSoldiers()) * 0.00016f;
+        if (army.hasStrategist()) {
+            score += army.strategist.logistics * 2.0f;
+            score += army.strategist.retreat * 0.8f;
+            score += army.strategist.lure * 0.5f;
+        }
+        if (army.hasCommander()) {
+            score += army.commander.defense * 0.7f;
+            score += army.commander.morale * 0.5f;
+        }
+        return score;
+    };
+    auto bestByScore = [&](const std::vector<ArmyID>& ids, auto&& predicate, auto&& scoreFn) {
+        ArmyID best = NO_ARMY;
+        float bestScore = -1e9f;
+        for (ArmyID aid : ids) {
+            Army& army = armies_.at(aid);
+            if (!predicate(army)) continue;
+            const float score = scoreFn(army);
+            if (score > bestScore) {
+                bestScore = score;
+                best = aid;
+            }
+        }
+        return best;
+    };
+    auto tileDistance = [&](TileID a, TileID b) {
+        if (a == NO_TILE || b == NO_TILE) return 1e9f;
+        const auto ap = worldMap_.at(a).position;
+        const auto bp = worldMap_.at(b).position;
+        return std::hypot(float(ap.x - bp.x), float(ap.y - bp.y));
+    };
+    auto relationAtWar = [&](KingdomID a, KingdomID b) {
+        if (a == b || a == NO_KINGDOM || b == NO_KINGDOM) return false;
+        KingdomID lo = std::min(a, b);
+        KingdomID hi = std::max(a, b);
+        auto it = relations_.find(lo);
+        if (it == relations_.end()) return false;
+        auto it2 = it->second.find(hi);
+        return it2 != it->second.end() && it2->second.state == RelationState::War;
+    };
+    auto nearestEnemyArmyDistance = [&](KingdomID owner, TileID tile) {
+        float best = 1e9f;
+        for (const auto& [enemyAid, enemyArmy] : armies_) {
+            (void)enemyAid;
+            if (enemyArmy.owner == owner || enemyArmy.isEmpty()) continue;
+            if (!kingdoms_.count(enemyArmy.owner) || !kingdoms_.at(enemyArmy.owner).isAlive) continue;
+            if (!relationAtWar(owner, enemyArmy.owner)) continue;
+            best = std::min(best, tileDistance(tile, enemyArmy.currentTile));
+        }
+        return best;
+    };
+    auto assignArmyTarget = [&](Army& army, TileID target) {
+        if (target == NO_TILE || army.targetTile == target) return;
+        army.targetTile = target;
+        army.movementPath.clear();
+        army.pathCursor = 0;
+    };
+
     for (auto& [aid, army] : armies_) {
         army.role = ArmyRole::Reserve;
     }
 
     for (auto& [kid, k] : kingdoms_) {
         if (!k.isAlive) continue;
+        const int aliveRealms = static_cast<int>(std::count_if(
+            kingdoms_.begin(), kingdoms_.end(),
+            [](const auto& p) { return p.second.isAlive && !p.second.isRebel; }));
+        const bool decisiveEndgame = currentTurn_ >= 2600 || aliveRealms <= 2;
 
         std::vector<ArmyID> living;
         living.reserve(k.armies.size());
@@ -369,7 +490,8 @@ void SimulationEngine::assignArmyRoles() {
         } else if (k.policy == NationalPolicy::Rebuilding ||
                    k.personality == KingdomPersonality::Defensive) {
             defenseSlots = 1;
-        } else if (k.policy == NationalPolicy::Invading &&
+        } else if (!decisiveEndgame &&
+                   k.policy == NationalPolicy::Invading &&
                    k.cities.size() >= 2 &&
                    living.size() >= 3) {
             // Keep a home guard while campaigning so one front can advance
@@ -395,6 +517,35 @@ void SimulationEngine::assignArmyRoles() {
         for (int i = 0; i < defenseSlots; ++i) {
             armies_.at(living[i]).role = ArmyRole::Defense;
         }
+        if (defenseSlots > 0) {
+            const ArmyRole homeRole =
+                (k.personality == KingdomPersonality::Defensive ||
+                 k.policy == NationalPolicy::Defending ||
+                 k.cities.size() <= 2)
+                    ? ArmyRole::Garrison
+                    : ArmyRole::SupplyGuard;
+            std::vector<ArmyID> homeCandidates;
+            homeCandidates.reserve(static_cast<size_t>(defenseSlots));
+            for (int i = 0; i < defenseSlots; ++i) homeCandidates.push_back(living[i]);
+            const ArmyID homeAid = bestByScore(
+                homeCandidates,
+                [](const Army&) { return true; },
+                homeRole == ArmyRole::Garrison ? defenseScore : supplyScore);
+            Army& homeArmy = armies_.at(homeAid == NO_ARMY ? living[0] : homeAid);
+            homeArmy.role = homeRole;
+            // Lock Garrison to capital so it never wanders to the frontline
+            if (homeRole == ArmyRole::Garrison &&
+                k.capitalCity != NO_CITY &&
+                cities_.count(k.capitalCity) &&
+                cities_.at(k.capitalCity).tile != NO_TILE) {
+                TileID capitalTile = cities_.at(k.capitalCity).tile;
+                if (homeArmy.targetTile != capitalTile) {
+                    homeArmy.targetTile    = capitalTile;
+                    homeArmy.movementPath.clear();
+                    homeArmy.pathCursor    = 0;
+                }
+            }
+        }
         for (int i = 0; i < reserveSlots; ++i) {
             const size_t idx = static_cast<size_t>(defenseSlots + i);
             if (idx < living.size()) {
@@ -403,17 +554,16 @@ void SimulationEngine::assignArmyRoles() {
             }
         }
 
-        ArmyID siegeArmy = NO_ARMY;
-        for (ArmyID aid : living) {
-            if (armies_.at(aid).role == ArmyRole::Defense) continue;
-            for (const auto& unit : armies_.at(aid).units) {
-                if (unit.type == UnitType::SiegeUnit && unit.soldiers > 0) {
-                    siegeArmy = aid;
-                    break;
+        ArmyID siegeArmy = bestByScore(
+            living,
+            [&](const Army& army) {
+                if (isDefenseRole(army.role)) return false;
+                for (const auto& unit : army.units) {
+                    if (unit.type == UnitType::SiegeUnit && unit.soldiers > 0) return true;
                 }
-            }
-            if (siegeArmy != NO_ARMY) break;
-        }
+                return false;
+            },
+            siegeScore);
 
         if ((k.policy == NationalPolicy::Invading || k.policy == NationalPolicy::FinalWar) &&
             siegeArmy != NO_ARMY) {
@@ -425,15 +575,18 @@ void SimulationEngine::assignArmyRoles() {
         if ((k.policy == NationalPolicy::Invading || k.policy == NationalPolicy::FinalWar) &&
             siegeArmy == NO_ARMY &&
             living.size() >= 2) {
-            for (ArmyID aid : living) {
-                Army& candidate = armies_.at(aid);
-                if (candidate.role == ArmyRole::Defense || candidate.units.empty()) continue;
-                if (candidate.totalSoldiers() < 650 && k.policy != NationalPolicy::FinalWar) continue;
+            siegeArmy = bestByScore(
+                living,
+                [&](const Army& candidate) {
+                    if (isDefenseRole(candidate.role) || candidate.units.empty()) return false;
+                    return candidate.totalSoldiers() >= 650 || k.policy == NationalPolicy::FinalWar;
+                },
+                siegeScore);
+            if (siegeArmy != NO_ARMY) {
+                Army& candidate = armies_.at(siegeArmy);
                 candidate.units.front().type = UnitType::SiegeUnit;
                 candidate.units.front().equipment = std::max(candidate.units.front().equipment, 0.62f);
                 candidate.role = ArmyRole::Siege;
-                siegeArmy = aid;
-                break;
             }
         }
 
@@ -453,6 +606,165 @@ void SimulationEngine::assignArmyRoles() {
             } else if (k.policy == NationalPolicy::Invading ||
                        k.policy == NationalPolicy::FinalWar) {
                 army.role = ArmyRole::Attack;
+            }
+        }
+
+        if (k.policy == NationalPolicy::Invading || k.policy == NationalPolicy::FinalWar) {
+            std::vector<ArmyID> attackers;
+            attackers.reserve(living.size());
+            for (ArmyID aid : living) {
+                if (armies_.at(aid).role == ArmyRole::Attack) attackers.push_back(aid);
+            }
+
+            const ArmyID vanguard = bestByScore(
+                attackers,
+                [](const Army&) { return true; },
+                vanguardScore);
+            if (vanguard != NO_ARMY) {
+                armies_.at(vanguard).role = ArmyRole::Vanguard;
+                attackers.erase(std::remove(attackers.begin(), attackers.end(), vanguard), attackers.end());
+            }
+
+            int flankers = 0;
+            const int desiredFlankers = living.size() >= 8 ? 2 :
+                                        living.size() >= 4 ? 1 : 0;
+            while (flankers < desiredFlankers && !attackers.empty()) {
+                const ArmyID flanker = bestByScore(
+                    attackers,
+                    [](const Army&) { return true; },
+                    flankerScore);
+                if (flanker == NO_ARMY) break;
+                armies_.at(flanker).role = ArmyRole::Flanker;
+                attackers.erase(std::remove(attackers.begin(), attackers.end(), flanker), attackers.end());
+                ++flankers;
+            }
+        } else if (k.policy == NationalPolicy::Rebuilding && living.size() >= 4) {
+            const ArmyID supplyGuard = bestByScore(
+                living,
+                [](const Army& army) {
+                    return army.role == ArmyRole::Reserve && army.supplyLevel >= 0.70f;
+                },
+                supplyScore);
+            if (supplyGuard != NO_ARMY) {
+                armies_.at(supplyGuard).role = ArmyRole::SupplyGuard;
+            }
+        }
+
+        if (!decisiveEndgame &&
+            (k.policy == NationalPolicy::Defending ||
+             k.personality == KingdomPersonality::Defensive) &&
+            living.size() >= 4 &&
+            k.cities.size() >= 5) {
+            const int desiredGarrisons = std::min<int>(
+                3,
+                std::max(1, static_cast<int>(living.size()) / 4));
+            int currentGarrisons = 0;
+            for (ArmyID aid : living) {
+                if (armies_.at(aid).role == ArmyRole::Garrison) ++currentGarrisons;
+            }
+            while (currentGarrisons < desiredGarrisons) {
+                const ArmyID guard = bestByScore(
+                    living,
+                    [&](const Army& army) {
+                        return army.role == ArmyRole::Reserve ||
+                               army.role == ArmyRole::Defense ||
+                               army.role == ArmyRole::SupplyGuard;
+                    },
+                    defenseScore);
+                if (guard == NO_ARMY || armies_.at(guard).role == ArmyRole::Garrison) break;
+                armies_.at(guard).role = ArmyRole::Garrison;
+                ++currentGarrisons;
+            }
+        }
+
+        if (!decisiveEndgame &&
+            (k.policy == NationalPolicy::Invading || k.policy == NationalPolicy::FinalWar) &&
+            living.size() >= 7 &&
+            k.cities.size() >= 8) {
+            int currentSupplyGuards = 0;
+            for (ArmyID aid : living) {
+                if (armies_.at(aid).role == ArmyRole::SupplyGuard) ++currentSupplyGuards;
+            }
+            if (currentSupplyGuards < 2) {
+                const ArmyID guard = bestByScore(
+                    living,
+                    [&](const Army& army) {
+                        return army.role == ArmyRole::Reserve ||
+                               army.role == ArmyRole::Defense;
+                    },
+                    supplyScore);
+                if (guard != NO_ARMY) armies_.at(guard).role = ArmyRole::SupplyGuard;
+            }
+        }
+
+        std::vector<TileID> assignedGuardTiles;
+        auto chooseGarrisonTarget = [&](const Kingdom& kingdom) {
+            TileID bestTile = NO_TILE;
+            float bestScore = -1e9f;
+            for (CityID cid : kingdom.cities) {
+                if (!cities_.count(cid)) continue;
+                const City& city = cities_.at(cid);
+                if (city.owner != kingdom.id || city.tile == NO_TILE) continue;
+                if (std::find(assignedGuardTiles.begin(), assignedGuardTiles.end(), city.tile) !=
+                    assignedGuardTiles.end()) {
+                    continue;
+                }
+                const float threatDist = nearestEnemyArmyDistance(kingdom.id, city.tile);
+                float score = static_cast<float>(city.population) * 0.004f;
+                if (city.isCapital || kingdom.capitalCity == cid) score += 70.0f;
+                if (city.cityType == CityType::Fortress) score += 44.0f;
+                if (city.cityType == CityType::TradeHub || city.cityType == CityType::Port) score += 18.0f;
+                if (threatDist < 36.0f) score += (36.0f - threatDist) * 2.2f;
+                score += city.fortification * 20.0f;
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestTile = city.tile;
+                }
+            }
+            return bestTile;
+        };
+        auto chooseSupplyGuardTarget = [&](const Kingdom& kingdom) {
+            TileID bestTile = NO_TILE;
+            float bestScore = -1e9f;
+            for (const Tile& tile : worldMap_.tiles()) {
+                if (tile.owner != kingdom.id) continue;
+                if (tile.strategicPoint != StrategicPointType::SupplyDepot &&
+                    tile.strategicPoint != StrategicPointType::Bridge &&
+                    tile.strategicPoint != StrategicPointType::HarborSite &&
+                    tile.strategicPoint != StrategicPointType::RiverFord) {
+                    continue;
+                }
+                if (std::find(assignedGuardTiles.begin(), assignedGuardTiles.end(), tile.id) !=
+                    assignedGuardTiles.end()) {
+                    continue;
+                }
+                const float threatDist = nearestEnemyArmyDistance(kingdom.id, tile.id);
+                float score = tile.strategicValue;
+                if (tile.strategicPoint == StrategicPointType::SupplyDepot) score += 55.0f;
+                if (tile.strategicPoint == StrategicPointType::Bridge) score += 36.0f;
+                if (tile.strategicPoint == StrategicPointType::HarborSite) score += 30.0f;
+                if (tile.strategicPoint == StrategicPointType::RiverFord) score += 24.0f;
+                if (threatDist < 42.0f) score += (42.0f - threatDist) * 1.6f;
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestTile = tile.id;
+                }
+            }
+            if (bestTile != NO_TILE) return bestTile;
+            return chooseGarrisonTarget(kingdom);
+        };
+
+        for (ArmyID aid : living) {
+            Army& army = armies_.at(aid);
+            TileID target = NO_TILE;
+            if (army.role == ArmyRole::Garrison) {
+                target = chooseGarrisonTarget(k);
+            } else if (army.role == ArmyRole::SupplyGuard) {
+                target = chooseSupplyGuardTarget(k);
+            }
+            if (target != NO_TILE) {
+                assignedGuardTiles.push_back(target);
+                assignArmyTarget(army, target);
             }
         }
     }

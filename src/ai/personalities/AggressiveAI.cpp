@@ -1,3 +1,12 @@
+// AggressiveAI — 侵略特化型
+// 該当王国: Blackthorn（茨の侵略国）, Embervast（燃え広がる軍事大国）, Embermarch（国境の炎）
+//
+// 戦略方針:
+//   - 序盤から積極的に宣戦布告し、領土を力で奪う
+//   - FinalWar 発動時は生存する全王国に同時宣戦（殲滅モード）
+//   - CapitalRush 戦略で敵首都を直接狙い、早期決着を狙う
+//   - 外交・同盟は一切考慮しない純粋な戦争マシン
+
 #include "jke/ai/personalities/AggressiveAI.hpp"
 #include <algorithm>
 
@@ -27,7 +36,7 @@ std::vector<AIDecision> AggressiveAI::evaluate(const AIContext& ctx) const {
     } else if (enemies(ctx).empty()) {
         // Always be at war — declare on weakest neighbor
         KingdomID target = self.strategicTarget != NO_KINGDOM
-            ? self.strategicTarget : findWeakestNeighbor(ctx);
+            ? self.strategicTarget : findBestWarTarget(ctx);
         if (target != NO_KINGDOM && !alliedWith(ctx, target)) {
             AIDecision d;
             d.type      = AIDecisionType::DeclareWar;
@@ -50,9 +59,7 @@ std::vector<AIDecision> AggressiveAI::evaluate(const AIContext& ctx) const {
 
         auto it = ctx.kingdoms.find(enemy);
         if (it != ctx.kingdoms.end()) {
-            // CapitalRush: always aim at enemy capital
-            CityID targetCity = capitalRush ? it->second.capitalCity
-                                            : it->second.capitalCity; // fallback same for now
+            CityID targetCity = findBestAttackCity(ctx, enemy);
             if (targetCity != NO_CITY) {
                 AIDecision d;
                 d.type       = AIDecisionType::Attack;

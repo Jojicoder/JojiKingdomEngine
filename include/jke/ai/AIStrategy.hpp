@@ -44,6 +44,9 @@ protected:
     static std::vector<KingdomID> allies(const AIContext& ctx);
     static KingdomID findBestAllyTarget(const AIContext& ctx);
     static TechID    bestAvailableTech(const AIContext& ctx);
+    static float     militaryStrength(const AIContext& ctx, KingdomID kingdom);
+    static KingdomID findBestWarTarget(const AIContext& ctx);
+    static CityID    findBestAttackCity(const AIContext& ctx, KingdomID enemy);
 };
 
 } // namespace jke

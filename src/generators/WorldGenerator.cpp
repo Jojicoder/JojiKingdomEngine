@@ -136,8 +136,9 @@ void placeStrategicPoints(GeneratedWorld& world) {
 
 } // namespace
 
-WorldGenerator::WorldGenerator(uint64_t seed)
-    : rng_(seed), seed_(seed) {}
+WorldGenerator::WorldGenerator(uint64_t seed, int kingdomCount)
+    : rng_(seed)
+    , kingdomCount_(std::clamp(kingdomCount, 4, constants::NUM_KINGDOMS)) {}
 
 GeneratedWorld WorldGenerator::generate() {
     GeneratedWorld world{
@@ -152,7 +153,7 @@ GeneratedWorld WorldGenerator::generate() {
 
     // Step 2: Nations + territory
     NationGenerator nationGen(rng_);
-    nationGen.generate(world);
+    nationGen.generate(world, kingdomCount_);
 
     // Step 3: Cities (capitals)
     CityGenerator cityGen(rng_);

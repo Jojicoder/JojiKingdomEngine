@@ -6,7 +6,7 @@ namespace jke {
 class NationGenerator {
 public:
     explicit NationGenerator(Random& rng);
-    void generate(GeneratedWorld& world);
+    void generate(GeneratedWorld& world, int kingdomCount);
 
 private:
     Random& rng_;

@@ -47,7 +47,8 @@ private:
         BattleContext ctx,
         std::unordered_map<ArmyID, Army>& armies,
         std::unordered_map<KingdomID, Kingdom>& kingdoms,
-        std::unordered_map<CityID, City>& cities
+        std::unordered_map<CityID, City>& cities,
+        const WorldMap& worldMap
     );
 
     void applyResult(

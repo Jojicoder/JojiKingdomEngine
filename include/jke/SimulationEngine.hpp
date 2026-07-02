@@ -33,8 +33,9 @@ namespace jke {
 
 struct SimulationConfig {
     uint64_t    seed          = 42;
+    uint32_t    initialKingdoms = constants::NUM_KINGDOMS;
     // 0 means unlimited turns; the simulation runs until unification or user exit.
-    uint32_t    maxTurns      = 2000;
+    uint32_t    maxTurns      = 0;
     std::string outputDir     = "output";
     bool        verbose       = false;
 };
@@ -54,6 +55,8 @@ public:
 
     // Public init for viewer (run() calls this internally too)
     void initializeWorld_pub() { initializeWorld(); }
+    void reset();
+    void setInitialKingdoms(uint32_t count);
 
     bool isOver() const { return simulationOver_; }
 
@@ -144,6 +147,7 @@ private:
     void runTurn();
     void runAIPhase();
     void executeDecision(const AIDecision& decision);
+    bool assignLocalNeutralExpansion(KingdomID kingdom);
     void updateStrategicPostures();
     void assignArmyRoles();
     void enforceSupplyRetreats();

@@ -30,6 +30,17 @@ void EconomyEngine::update(
         k.perTurnIncome.food *= smods.foodMult;
         k.perTurnIncome.gold *= smods.goldMult;
 
+        if (k.warWeariness > 0.20f) {
+            const float fatigue = std::clamp((k.warWeariness - 0.20f) / 0.80f, 0.0f, 1.0f);
+            const float laborMult = 1.0f - fatigue * 0.38f;
+            const float tradeMult = 1.0f - fatigue * 0.46f;
+            k.perTurnIncome.food  *= laborMult;
+            k.perTurnIncome.wood  *= laborMult;
+            k.perTurnIncome.stone *= laborMult;
+            k.perTurnIncome.iron  *= laborMult;
+            k.perTurnIncome.gold  *= tradeMult;
+        }
+
         ResourceLedger net = k.perTurnIncome - k.perTurnExpense;
 
         // Apply net to treasury
@@ -61,6 +72,8 @@ void EconomyEngine::update(
         // Stability decay from economic trouble
         if (k.debtTurns > 0 || k.starvationTurns > 0) {
             k.stability -= 0.02f;
+        } else if (k.warWeariness > 0.75f) {
+            k.stability -= 0.008f;
         } else {
             k.stability = std::min(1.0f, k.stability + 0.01f);
         }
@@ -269,7 +282,13 @@ void EconomyEngine::growPopulation(
         City& c = it->second;
         if (!c.isRuined) {
             float growthRate = 0.005f * c.happiness;
-            c.population = static_cast<uint32_t>(c.population * (1.0f + growthRate));
+            if (k.warWeariness > 0.25f) {
+                const float fatigue = std::clamp((k.warWeariness - 0.25f) / 0.75f, 0.0f, 1.0f);
+                growthRate *= 1.0f - fatigue * 0.85f;
+                if (k.warWeariness > 0.88f) growthRate -= 0.0015f;
+            }
+            const float nextPopulation = static_cast<float>(c.population) * (1.0f + growthRate);
+            c.population = std::max<uint32_t>(1, static_cast<uint32_t>(nextPopulation));
         }
         k.totalPopulation += c.population;
     }
@@ -283,6 +302,9 @@ void EconomyEngine::updateCityHappiness(const Kingdom& k, City& c) const {
     target -= (c.taxRate - 0.15f) * 1.5f;
     // Under siege → unhappy
     if (c.underSiege) target -= 0.3f;
+    if (k.warWeariness > 0.35f) {
+        target -= std::min(0.30f, (k.warWeariness - 0.35f) * 0.38f);
+    }
 
     // Drift toward target
     c.happiness += (target - c.happiness) * 0.1f;

@@ -102,7 +102,7 @@ int main() {
     ctx.terrain = jke::TerrainType::Plain;
     ctx.contestedCity = 1;
 
-    auto result = battleEngine.resolveBattle(ctx, armies, kingdoms, cities);
+    auto result = battleEngine.resolveBattle(ctx, armies, kingdoms, cities, map);
     assert(result.victor == 1);
     assert(!result.cityConquered && "Owner victory must not reconquer its own city");
 

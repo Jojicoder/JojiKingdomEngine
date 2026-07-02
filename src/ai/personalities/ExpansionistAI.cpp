@@ -1,3 +1,12 @@
+// ExpansionistAI — 版図拡張型
+// 該当王国: Ironspire（鉄の帝国を広げる野心家）, Dawnreach（肥沃な土地を求め続ける）, Highcrest（誇り高い高台の覇者）, Crownsreach（経済力で覇権を狙う）
+//
+// 戦略方針:
+//   - 序盤は同盟を結んで基盤を固め、中盤から積極的に版図を広げる
+//   - 弱小国から順番に吸収し、都市数で他国を圧倒する
+//   - TotalConquest 戦略では最終的に全王国の制圧を目指す
+//   - 外交と戦争を状況に応じて使い分ける戦略的な拡張主義
+
 #include "jke/ai/personalities/ExpansionistAI.hpp"
 #include <algorithm>
 
@@ -45,7 +54,7 @@ std::vector<AIDecision> ExpansionistAI::evaluate(const AIContext& ctx) const {
         KingdomID target = (self.strategicTarget != NO_KINGDOM &&
                             ctx.kingdoms.count(self.strategicTarget) &&
                             ctx.kingdoms.at(self.strategicTarget).isAlive)
-            ? self.strategicTarget : findWeakestNeighbor(ctx);
+            ? self.strategicTarget : findBestWarTarget(ctx);
 
         if (target != NO_KINGDOM && !alliedWith(ctx, target) &&
             !atWarWith(ctx, target) && self.treasury.gold > 80.0f &&
@@ -68,11 +77,13 @@ std::vector<AIDecision> ExpansionistAI::evaluate(const AIContext& ctx) const {
         for (KingdomID enemy : enemyList) {
             auto it = ctx.kingdoms.find(enemy);
             if (it == ctx.kingdoms.end() || it->second.capitalCity == NO_CITY) continue;
+            CityID targetCity = findBestAttackCity(ctx, enemy);
+            if (targetCity == NO_CITY) continue;
             AIDecision d;
             d.type       = AIDecisionType::Attack;
             d.actor      = self.id;
             d.target     = enemy;
-            d.targetCity = it->second.capitalCity;
+            d.targetCity = targetCity;
             d.targetArmy = self.armies.front();
             d.priority   = totalConquest ? 0.94f - attackSlot * 0.02f : 0.88f;
             d.reasoning  = "Expansionist: march on enemy";

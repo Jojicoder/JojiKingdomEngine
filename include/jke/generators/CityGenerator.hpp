@@ -18,7 +18,7 @@ private:
     void assignCityType(City& city, const Tile& t,
                         const GeneratedWorld& world, TileID tile) const;
     std::string generateCityName(const std::string& kingdomName, bool isCapital) const;
-    std::string generateOutpostName(TerrainType terrain) const;
+    std::string generateOutpostName(TerrainType terrain, int index) const;
     void placeNeutralOutposts(GeneratedWorld& world);
 };
 

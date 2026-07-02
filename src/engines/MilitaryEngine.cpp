@@ -5,13 +5,108 @@
 #include <unordered_map>
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace jke {
 namespace {
-bool isClaimableTerritory(TerrainType terrain) {
+bool isPathableTerrain(TerrainType terrain) {
     return terrain != TerrainType::Ocean &&
-           terrain != TerrainType::Coast &&
            terrain != TerrainType::Lake;
+}
+
+struct SharedRoute {
+    std::vector<float> costToTarget;
+    std::vector<TileID> nextStep;
+};
+
+struct SupplySource {
+    Coordinate position;
+    bool isPort = false;
+};
+
+void buildSharedRouteToTarget(
+    const WorldMap& map,
+    TileID target,
+    const std::vector<TileID>& origins,
+    SharedRoute& route)
+{
+    const auto tileCount = static_cast<size_t>(map.tileCount());
+    route.costToTarget.assign(tileCount, std::numeric_limits<float>::infinity());
+    route.nextStep.assign(tileCount, NO_TILE);
+
+    if (target == NO_TILE || target >= static_cast<TileID>(map.tileCount())) return;
+    if (!isPathableTerrain(map.at(target).terrain)) return;
+
+    std::vector<uint8_t> wanted(tileCount, 0);
+    size_t remaining = 0;
+    for (TileID origin : origins) {
+        if (origin == NO_TILE || origin >= static_cast<TileID>(map.tileCount())) continue;
+        if (origin == target) continue;
+        if (!isPathableTerrain(map.at(origin).terrain)) continue;
+        if (wanted[origin] == 0) {
+            wanted[origin] = 1;
+            ++remaining;
+        }
+    }
+    if (remaining == 0) return;
+
+    struct Node {
+        float cost;
+        TileID id;
+        bool operator>(const Node& o) const { return cost > o.cost; }
+    };
+
+    std::priority_queue<Node, std::vector<Node>, std::greater<Node>> open;
+    route.costToTarget[target] = 0.0f;
+    open.push({0.0f, target});
+
+    while (!open.empty()) {
+        Node node = open.top();
+        open.pop();
+        if (node.cost > route.costToTarget[node.id]) continue;
+        if (wanted[node.id] != 0) {
+            wanted[node.id] = 0;
+            if (--remaining == 0) break;
+        }
+
+        TileID nbs[4]; int nCount = map.neighbors4(node.id, nbs);
+        for (int ni = 0; ni < nCount; ++ni) {
+            TileID nb = nbs[ni];
+            if (!isPathableTerrain(map.at(nb).terrain)) continue;
+
+            const float stepCost = terrainMoveCost(map.at(node.id).terrain);
+            const float candidate = node.cost + stepCost;
+            if (candidate < route.costToTarget[nb]) {
+                route.costToTarget[nb] = candidate;
+                route.nextStep[nb] = node.id;
+                open.push({candidate, nb});
+            }
+        }
+    }
+}
+
+std::vector<TileID> pathFromSharedRoute(
+    const SharedRoute& route,
+    TileID from,
+    TileID target,
+    size_t tileCount)
+{
+    std::vector<TileID> path;
+    if (from == target || from >= static_cast<TileID>(tileCount)) return path;
+    if (target >= static_cast<TileID>(tileCount)) return path;
+    if (route.nextStep.empty() || route.nextStep[from] == NO_TILE) return path;
+
+    TileID cur = from;
+    path.reserve(64);
+    for (size_t guard = 0; guard < tileCount && cur != target; ++guard) {
+        TileID next = route.nextStep[cur];
+        if (next == NO_TILE) return {};
+        path.push_back(next);
+        cur = next;
+    }
+
+    if (cur != target) return {};
+    return path;
 }
 }
 
@@ -37,6 +132,23 @@ void MilitaryEngine::moveArmies(
     // Base movement budget per turn (plain = 1 cost, mountain = 4 cost)
     constexpr float BASE_MOVEMENT = 4.0f;
     const SeasonModifiers mods = seasonMods(season);
+    const auto tileCount = static_cast<size_t>(worldMap.tileCount());
+
+    std::unordered_map<TileID, std::vector<TileID>> staleTargetOrigins;
+    staleTargetOrigins.reserve(armies.size());
+    for (const auto& [aid, army] : armies) {
+        (void)aid;
+        if (army.isInBattle || army.isBesieging) continue;
+        if (army.targetTile == NO_TILE || army.targetTile == army.currentTile) continue;
+        const bool pathStale = army.movementPath.empty() ||
+                               army.pathCursor >= army.movementPath.size() ||
+                               army.movementPath.back() != army.targetTile;
+        if (pathStale) {
+            staleTargetOrigins[army.targetTile].push_back(army.currentTile);
+        }
+    }
+
+    std::unordered_map<TileID, SharedRoute> sharedRoutes;
 
     for (auto& [aid, army] : armies) {
         // Refresh movement points each turn
@@ -50,7 +162,16 @@ void MilitaryEngine::moveArmies(
                          army.pathCursor >= army.movementPath.size() ||
                          army.movementPath.back() != army.targetTile;
         if (pathStale) {
-            army.movementPath = findPath(worldMap, army.currentTile, army.targetTile);
+            auto originsIt = staleTargetOrigins.find(army.targetTile);
+            if (originsIt != staleTargetOrigins.end() && originsIt->second.size() > 1) {
+                auto [routeIt, inserted] = sharedRoutes.try_emplace(army.targetTile);
+                if (inserted) {
+                    buildSharedRouteToTarget(worldMap, army.targetTile, originsIt->second, routeIt->second);
+                }
+                army.movementPath = pathFromSharedRoute(routeIt->second, army.currentTile, army.targetTile, tileCount);
+            } else {
+                army.movementPath = findPath(worldMap, army.currentTile, army.targetTile);
+            }
             army.pathCursor   = 0;
         }
 
@@ -82,14 +203,6 @@ void MilitaryEngine::moveArmies(
             army.position    = worldMap.at(next).position;
             worldMap.at(next).army = aid;
 
-            // Claim land while advancing; city tiles only change after conquest
-            Tile& newTile = worldMap.at(next);
-            if (newTile.owner != army.owner &&
-                newTile.city == NO_CITY &&
-                isClaimableTerritory(newTile.terrain)) {
-                newTile.owner = army.owner;
-            }
-
             if (army.currentTile == army.targetTile) {
                 army.targetTile = NO_TILE;
                 army.movementPath.clear();
@@ -107,8 +220,30 @@ void MilitaryEngine::decaySupply(
     Season season) const
 {
     const SeasonModifiers mods = seasonMods(season);
+    std::unordered_map<KingdomID, std::vector<SupplySource>> supplySourcesByOwner;
+    supplySourcesByOwner.reserve(cities.size());
+
+    for (const auto& [cid, city] : cities) {
+        (void)cid;
+        if (city.owner == NO_KINGDOM || city.tile == NO_TILE) continue;
+        supplySourcesByOwner[city.owner].push_back({city.position, city.cityType == CityType::Port});
+    }
+
+    for (const Tile& supplyTile : worldMap.tiles()) {
+        if (supplyTile.owner == NO_KINGDOM) continue;
+        if (supplyTile.strategicPoint != StrategicPointType::SupplyDepot &&
+            supplyTile.strategicPoint != StrategicPointType::HarborSite &&
+            supplyTile.strategicPoint != StrategicPointType::Bridge) {
+            continue;
+        }
+        supplySourcesByOwner[supplyTile.owner].push_back({
+            supplyTile.position,
+            supplyTile.strategicPoint == StrategicPointType::HarborSite
+        });
+    }
 
     for (auto& [aid, army] : armies) {
+        (void)aid;
         if (army.currentTile == NO_TILE ||
             army.currentTile >= static_cast<TileID>(worldMap.tileCount())) {
             continue;
@@ -119,37 +254,28 @@ void MilitaryEngine::decaySupply(
         // Compare squared distances — sqrt only on the winner to compute effectiveRange
         float nearestDistSq = 1e18f;
         bool  nearestIsPort = false;
-        for (const auto& [cid, city] : cities) {
-            if (city.owner != army.owner || city.tile == NO_TILE) continue;
-            float dx = float(armyPos.x - city.position.x);
-            float dy = float(armyPos.y - city.position.y);
-            float distSq = dx*dx + dy*dy;
-            if (distSq < nearestDistSq) {
-                nearestDistSq = distSq;
-                nearestIsPort = (city.cityType == CityType::Port);
-                if (distSq < 64.0f) break;  // < 8 tiles away — close enough
-            }
-        }
-        for (const Tile& supplyTile : worldMap.tiles()) {
-            if (supplyTile.owner != army.owner) continue;
-            if (supplyTile.strategicPoint != StrategicPointType::SupplyDepot &&
-                supplyTile.strategicPoint != StrategicPointType::HarborSite &&
-                supplyTile.strategicPoint != StrategicPointType::Bridge) {
-                continue;
-            }
-            float dx = float(armyPos.x - supplyTile.position.x);
-            float dy = float(armyPos.y - supplyTile.position.y);
-            float distSq = dx*dx + dy*dy;
-            if (distSq < nearestDistSq) {
-                nearestDistSq = distSq;
-                nearestIsPort = supplyTile.strategicPoint == StrategicPointType::HarborSite;
-                if (distSq < 49.0f) break;
+        auto sourceIt = supplySourcesByOwner.find(army.owner);
+        if (sourceIt != supplySourcesByOwner.end()) {
+            for (const SupplySource& source : sourceIt->second) {
+                float dx = float(armyPos.x - source.position.x);
+                float dy = float(armyPos.y - source.position.y);
+                float distSq = dx*dx + dy*dy;
+                if (distSq < nearestDistSq) {
+                    nearestDistSq = distSq;
+                    nearestIsPort = source.isPort;
+                }
             }
         }
         float nearestCity = std::sqrt(nearestDistSq);
         // Port cities extend effective supply range by 8 tiles (coastal logistics)
         float effectiveRange = nearestCity;
         if (nearestIsPort) effectiveRange = std::max(0.0f, nearestCity - 8.0f);
+        if (army.hasStrategist()) {
+            const float wound = army.strategist.wounded ? 0.55f : 1.0f;
+            effectiveRange = std::max(
+                0.0f,
+                effectiveRange - (army.strategist.logistics - 1.0f) * 18.0f * wound);
+        }
 
         float delta = 0.05f;
         if (effectiveRange > 28.0f) {
@@ -241,7 +367,8 @@ void MilitaryEngine::removeEmptyArmies(
     }
 }
 
-// Greedy best-first pathfinding (good enough for strategic movement)
+// A* pathfinding for strategic movement. Scratch arrays are reused between calls
+// because this runs once per moving army when targets change.
 std::vector<TileID> MilitaryEngine::findPath(
     const WorldMap& map, TileID from, TileID to) const
 {
@@ -255,25 +382,40 @@ std::vector<TileID> MilitaryEngine::findPath(
         bool operator>(const Node& o) const { return priority > o.priority; }
     };
 
-    std::priority_queue<Node, std::vector<Node>, std::greater<Node>> open;
-    std::unordered_map<TileID, TileID>  cameFrom;
-    std::unordered_map<TileID, float>   gCost;
-    cameFrom.reserve(256);
-    gCost.reserve(256);
+    const auto tileCount = static_cast<size_t>(map.tileCount());
+    if (pathGCost_.size() < tileCount) {
+        pathGCost_.resize(tileCount);
+        pathCameFrom_.resize(tileCount, NO_TILE);
+        pathSeenStamp_.resize(tileCount, 0);
+        pathClosedStamp_.resize(tileCount, 0);
+    }
+
+    uint32_t stamp = pathSearchStamp_++;
+    if (pathSearchStamp_ == 0) {
+        std::fill(pathSeenStamp_.begin(), pathSeenStamp_.end(), 0);
+        std::fill(pathClosedStamp_.begin(), pathClosedStamp_.end(), 0);
+        pathSearchStamp_ = 1;
+        stamp = pathSearchStamp_++;
+    }
 
     auto heuristic = [&](TileID a, TileID b) -> float {
         auto [ax, ay] = map.coordOf(a);
         auto [bx, by] = map.coordOf(b);
-        return std::hypot(float(ax-bx), float(ay-by));
+        return float(std::abs(ax - bx) + std::abs(ay - by));
     };
 
-    open.push({0.0f, from});
-    gCost[from] = 0.0f;
+    std::priority_queue<Node, std::vector<Node>, std::greater<Node>> open;
+    open.push({heuristic(from, to), from});
+    pathGCost_[from] = 0.0f;
+    pathCameFrom_[from] = NO_TILE;
+    pathSeenStamp_[from] = stamp;
 
     int iterations = 0;
     constexpr int MAX_ITER = 3000; // prevent freeze on unreachable targets
     while (!open.empty() && iterations++ < MAX_ITER) {
         TileID cur = open.top().id; open.pop();
+        if (pathClosedStamp_[cur] == stamp) continue;
+        pathClosedStamp_[cur] = stamp;
         if (cur == to) break;
 
         TileID nbs[4]; int nCount = map.neighbors4(cur, nbs);
@@ -283,10 +425,11 @@ std::vector<TileID> MilitaryEngine::findPath(
             if (nt.terrain == TerrainType::Ocean ||
                 nt.terrain == TerrainType::Lake) continue;
 
-            float cost = gCost[cur] + terrainMoveCost(nt.terrain);
-            if (!gCost.count(nb) || cost < gCost[nb]) {
-                gCost[nb]    = cost;
-                cameFrom[nb] = cur;
+            float cost = pathGCost_[cur] + terrainMoveCost(nt.terrain);
+            if (pathSeenStamp_[nb] != stamp || cost < pathGCost_[nb]) {
+                pathSeenStamp_[nb] = stamp;
+                pathGCost_[nb] = cost;
+                pathCameFrom_[nb] = cur;
                 open.push({cost + heuristic(nb, to), nb});
             }
         }
@@ -295,11 +438,12 @@ std::vector<TileID> MilitaryEngine::findPath(
     // Reconstruct path
     std::vector<TileID> path;
     TileID cur = to;
+    if (pathSeenStamp_[cur] != stamp) return {};
     while (cur != from) {
-        auto it = cameFrom.find(cur);
-        if (it == cameFrom.end()) return {}; // no path
+        TileID prev = pathCameFrom_[cur];
+        if (prev == NO_TILE) return {}; // no path
         path.push_back(cur);
-        cur = it->second;
+        cur = prev;
     }
     std::reverse(path.begin(), path.end());
     return path;
@@ -367,12 +511,13 @@ ArmyID MilitaryEngine::spawnArmy(
     army.supplyLevel = 1.0f;
 
     const Kingdom& kRef2 = kingdoms.at(order.kingdom);
-    // Diplomatic kingdoms have less military culture → lower training
-    const float trainingBase = (kRef2.personality == KingdomPersonality::Diplomatic) ? 0.48f
-                             : (kRef2.personality == KingdomPersonality::Aggressive)  ? 0.95f
-                             : (kRef2.personality == KingdomPersonality::Expansionist)? 0.85f
-                             : (kRef2.personality == KingdomPersonality::Opportunistic)? 0.90f
-                             : 0.75f;
+    // Training quality reflects military culture of each personality
+    const float trainingBase = (kRef2.personality == KingdomPersonality::Aggressive)   ? 0.95f  // 純粋な戦士文化
+                             : (kRef2.personality == KingdomPersonality::Opportunistic) ? 0.90f  // 精鋭少数主義
+                             : (kRef2.personality == KingdomPersonality::Expansionist)  ? 0.85f  // 遠征で鍛えられる
+                             : (kRef2.personality == KingdomPersonality::Defensive)     ? 0.82f  // 守備訓練に特化
+                             : (kRef2.personality == KingdomPersonality::Economic)      ? 0.65f  // 傭兵頼り、自前訓練は低い
+                             : 0.48f;                                                            // Diplomatic: 非軍事文化
 
     Unit u;
     u.id        = nextUnitID++;

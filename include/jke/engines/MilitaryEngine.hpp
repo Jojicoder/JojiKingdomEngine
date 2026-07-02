@@ -1,5 +1,7 @@
 #pragma once
+#include <cstdint>
 #include <unordered_map>
+#include <vector>
 #include "jke/nation/Kingdom.hpp"
 #include "jke/army/Army.hpp"
 #include "jke/city/City.hpp"
@@ -53,6 +55,12 @@ private:
 
     // A* / greedy pathfinding on the tile grid
     std::vector<TileID> findPath(const WorldMap& map, TileID from, TileID to) const;
+
+    mutable std::vector<float> pathGCost_;
+    mutable std::vector<TileID> pathCameFrom_;
+    mutable std::vector<uint32_t> pathSeenStamp_;
+    mutable std::vector<uint32_t> pathClosedStamp_;
+    mutable uint32_t pathSearchStamp_ = 1;
 };
 
 } // namespace jke

@@ -6,6 +6,7 @@
 #include "jke/army/Army.hpp"
 #include "jke/technology/TechTree.hpp"
 #include "jke/core/Random.hpp"
+#include "jke/core/Constants.hpp"
 
 namespace jke {
 
@@ -23,12 +24,13 @@ struct GeneratedWorld {
 
 class WorldGenerator {
 public:
-    explicit WorldGenerator(uint64_t seed);
+    explicit WorldGenerator(uint64_t seed,
+                            int kingdomCount = constants::NUM_KINGDOMS);
     GeneratedWorld generate();
 
 private:
     Random rng_;
-    uint64_t seed_;
+    int kingdomCount_;
 };
 
 } // namespace jke

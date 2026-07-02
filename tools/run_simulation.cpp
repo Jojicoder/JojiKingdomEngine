@@ -10,7 +10,8 @@ static void printHelp(const char* progName) {
     std::cout << "Usage: " << progName << " [options]\n"
               << "Options:\n"
               << "  --seed <N>       Random seed (default: 42)\n"
-              << "  --turns <N>      Max simulation turns; 0 = unlimited until unification (default: 2000)\n"
+              << "  --kingdoms <N>   Starting kingdoms, clamped to 4-20 (default: 20)\n"
+              << "  --turns <N>      Max simulation turns; 0 = unlimited until unification (default: unlimited)\n"
               << "  --output <dir>   Output directory for JSON snapshots (default: output)\n"
               << "  --single         Write single output.json instead of per-turn files\n"
               << "  --no-output      Run simulation without writing JSON snapshots\n"
@@ -30,6 +31,10 @@ int main(int argc, char** argv) {
             return 0;
         } else if (arg == "--seed" && i + 1 < argc) {
             config.seed = std::stoull(argv[++i]);
+        } else if (arg == "--kingdoms" && i + 1 < argc) {
+            config.initialKingdoms =
+                std::clamp<uint32_t>(static_cast<uint32_t>(std::stoul(argv[++i])), 4u,
+                                     static_cast<uint32_t>(jke::constants::NUM_KINGDOMS));
         } else if (arg == "--turns" && i + 1 < argc) {
             config.maxTurns = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (arg == "--output" && i + 1 < argc) {
@@ -51,7 +56,7 @@ int main(int argc, char** argv) {
     std::cout << "Seed: " << config.seed << "  Turns: ";
     if (config.maxTurns == 0) std::cout << "unlimited";
     else std::cout << config.maxTurns;
-    std::cout << "\n\n";
+    std::cout << "  Kingdoms: " << config.initialKingdoms << "\n\n";
 
     jke::SimulationEngine engine(config);
 

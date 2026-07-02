@@ -1,4 +1,5 @@
 #pragma once
+#include <string>
 #include <string_view>
 #include <vector>
 #include "jke/army/Unit.hpp"
@@ -11,6 +12,10 @@ enum class ArmyRole : uint8_t {
     Defense = 1,
     Attack  = 2,
     Siege   = 3,
+    Vanguard = 4,
+    Flanker = 5,
+    Garrison = 6,
+    SupplyGuard = 7,
 };
 
 constexpr std::string_view armyRoleName(ArmyRole r) noexcept {
@@ -19,9 +24,41 @@ constexpr std::string_view armyRoleName(ArmyRole r) noexcept {
         case ArmyRole::Defense: return "Defense";
         case ArmyRole::Attack:  return "Attack";
         case ArmyRole::Siege:   return "Siege";
+        case ArmyRole::Vanguard: return "Vanguard";
+        case ArmyRole::Flanker: return "Flanker";
+        case ArmyRole::Garrison: return "Garrison";
+        case ArmyRole::SupplyGuard: return "SupplyGuard";
     }
     return "Unknown";
 }
+
+struct ArmyCommander {
+    std::string name;
+    float attack     = 1.0f;
+    float defense    = 1.0f;
+    float cavalry    = 1.0f;
+    float morale     = 1.0f;
+    float pursuit    = 1.0f;
+    float experience = 0.0f;
+    float fame       = 0.0f;
+    bool  fameEventLogged = false;
+    bool  wounded    = false;
+    bool  alive      = false;
+};
+
+struct ArmyStrategist {
+    std::string name;
+    float siege      = 1.0f;
+    float ambush     = 1.0f;
+    float retreat    = 1.0f;
+    float logistics  = 1.0f;
+    float lure       = 1.0f;
+    float experience = 0.0f;
+    float fame       = 0.0f;
+    bool  fameEventLogged = false;
+    bool  wounded    = false;
+    bool  alive      = false;
+};
 
 // Per-unit terrain combat multiplier table
 // [UnitType][TerrainType]
@@ -45,10 +82,14 @@ struct Army {
     TileID            targetTile    = NO_TILE;
     std::vector<TileID> movementPath;
     ArmyRole          role          = ArmyRole::Reserve;
+    ArmyCommander     commander;
+    ArmyStrategist    strategist;
 
     float             supplyLevel        = 1.0f;   // 0.0 – 1.0
     float             movementPoints     = 3.0f;   // refreshed each turn; spent per tile moved
     uint16_t          pathCursor         = 0;      // next index into movementPath (avoids erase)
+    bool              recoveringSupply   = false;
+    TurnNumber        supplyRetreatUntil = 0;
     bool              isInBattle    = false;
     bool              isBesieging   = false;
     // Mercenary fields
@@ -81,6 +122,12 @@ struct Army {
     }
 
     bool isEmpty() const noexcept { return totalSoldiers() == 0; }
+    bool hasCommander() const noexcept { return commander.alive; }
+    bool hasStrategist() const noexcept { return strategist.alive; }
+    bool hasNotableLeader() const noexcept {
+        return (commander.alive && commander.fame >= 0.45f) ||
+               (strategist.alive && strategist.fame >= 0.45f);
+    }
 };
 
 } // namespace jke

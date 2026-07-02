@@ -2,6 +2,7 @@
 #include "jke/core/Constants.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <unordered_set>
 
 namespace jke {
@@ -10,6 +11,90 @@ bool isClaimableTerritory(TerrainType terrain) {
     return terrain != TerrainType::Ocean &&
            terrain != TerrainType::Coast &&
            terrain != TerrainType::Lake;
+}
+
+float conquestRadiusTiles(const City& city) {
+    if (city.isCapital) return 16.0f;
+    switch (city.cityType) {
+        case CityType::Fortress:     return 13.0f;
+        case CityType::TradeHub:     return 12.0f;
+        case CityType::Port:         return 11.0f;
+        case CityType::Mining:       return 10.0f;
+        case CityType::Agricultural: return 10.0f;
+        case CityType::Generic:      return 9.0f;
+    }
+    return 9.0f;
+}
+
+bool armyHasUnit(const Army& army, UnitType type) {
+    for (const Unit& unit : army.units) {
+        if (unit.type == type && unit.soldiers > 0) return true;
+    }
+    return false;
+}
+
+float leaderCombatMultiplier(const Army& army, bool attackerSide, bool siegeBattle, TerrainType terrain) {
+    float mult = 1.0f;
+    const uint32_t soldiers = army.totalSoldiers();
+
+    if (!army.hasCommander()) {
+        if (soldiers >= 3500) return 0.84f;
+        if (soldiers >= 1800) return 0.91f;
+        return 0.97f;
+    }
+
+    const ArmyCommander& c = army.commander;
+    const float wound = c.wounded ? 0.55f : 1.0f;
+    const float mainSkill = attackerSide ? c.attack : c.defense;
+    mult *= 1.0f + (mainSkill - 1.0f) * 0.85f * wound;
+    mult *= 1.0f + (c.morale - 1.0f) * 0.35f * wound;
+    mult *= 1.0f + c.experience * 0.08f;
+
+    if (armyHasUnit(army, UnitType::Cavalry) &&
+        (terrain == TerrainType::Plain || terrain == TerrainType::River) &&
+        !siegeBattle) {
+        mult *= 1.0f + (c.cavalry - 1.0f) * 0.45f * wound;
+    }
+
+    return mult;
+}
+
+float strategistCombatMultiplier(const Army& army, bool attackerSide, bool siegeBattle, TerrainType terrain) {
+    if (!army.hasStrategist()) return 1.0f;
+
+    const ArmyStrategist& s = army.strategist;
+    const float wound = s.wounded ? 0.55f : 1.0f;
+    float mult = 1.0f + s.experience * 0.05f;
+
+    if (siegeBattle && attackerSide) {
+        mult *= 1.0f + (s.siege - 1.0f) * 0.65f * wound;
+    }
+    if (attackerSide &&
+        (terrain == TerrainType::Forest || terrain == TerrainType::Hill)) {
+        mult *= 1.0f + (s.ambush - 1.0f) * 0.55f * wound;
+    }
+    if (!attackerSide) {
+        mult *= 1.0f + (s.retreat - 1.0f) * 0.20f * wound;
+        if (terrain == TerrainType::Forest ||
+            terrain == TerrainType::Hill ||
+            terrain == TerrainType::Mountain) {
+            mult *= 1.0f + (s.lure - 1.0f) * 0.45f * wound;
+        }
+    }
+
+    return mult;
+}
+
+float pursuitMultiplier(const Army& winner) {
+    if (!winner.hasCommander()) return 1.0f;
+    const float wound = winner.commander.wounded ? 0.55f : 1.0f;
+    return 1.0f + (winner.commander.pursuit - 1.0f) * 0.75f * wound;
+}
+
+float retreatCasualtyMultiplier(const Army& loser) {
+    if (!loser.hasStrategist()) return 1.0f;
+    const float wound = loser.strategist.wounded ? 0.55f : 1.0f;
+    return 1.0f - std::clamp((loser.strategist.retreat - 1.0f) * 0.80f * wound, 0.0f, 0.18f);
 }
 }
 
@@ -31,9 +116,12 @@ void BattleEngine::update(
         if (!armies.count(ctx.attackerArmy)) continue;
         if (ctx.defenderArmy != NO_ARMY && !armies.count(ctx.defenderArmy)) continue;
         if (!kingdoms.count(ctx.attackerKingdom) || !kingdoms.at(ctx.attackerKingdom).isAlive) continue;
-        if (!kingdoms.count(ctx.defenderKingdom) || !kingdoms.at(ctx.defenderKingdom).isAlive) continue;
+        if (ctx.defenderKingdom != NO_KINGDOM &&
+            (!kingdoms.count(ctx.defenderKingdom) || !kingdoms.at(ctx.defenderKingdom).isAlive)) {
+            continue;
+        }
 
-        auto result = resolveBattle(ctx, armies, kingdoms, cities);
+        auto result = resolveBattle(ctx, armies, kingdoms, cities, worldMap);
         applyResult(result, armies, kingdoms, cities, worldMap, bus, turn);
     }
 }
@@ -197,7 +285,8 @@ BattleResult BattleEngine::resolveBattle(
     BattleContext ctx,
     std::unordered_map<ArmyID, Army>& armies,
     std::unordered_map<KingdomID, Kingdom>& kingdoms,
-    std::unordered_map<CityID, City>& cities)
+    std::unordered_map<CityID, City>& cities,
+    const WorldMap& worldMap)
 {
     BattleResult result;
     result.attackerArmy = ctx.attackerArmy;
@@ -214,6 +303,74 @@ BattleResult BattleEngine::resolveBattle(
             atkStr *= 0.93f;
         }
     }
+
+    auto roleTacticalMultiplier = [](ArmyRole role, bool attackerSide, bool siegeBattle) {
+        switch (role) {
+            case ArmyRole::Siege:
+                return siegeBattle ? (attackerSide ? 1.16f : 0.88f)
+                                   : (attackerSide ? 0.84f : 0.78f);
+            case ArmyRole::Vanguard:
+                return attackerSide ? (siegeBattle ? 1.03f : 1.18f)
+                                    : (siegeBattle ? 0.92f : 0.98f);
+            case ArmyRole::Flanker:
+                return attackerSide ? (siegeBattle ? 0.94f : 1.16f)
+                                    : (siegeBattle ? 0.86f : 0.94f);
+            case ArmyRole::Garrison:
+                return attackerSide ? 0.74f : (siegeBattle ? 1.20f : 1.18f);
+            case ArmyRole::SupplyGuard:
+                return attackerSide ? 0.88f : 1.10f;
+            case ArmyRole::Attack:
+                return attackerSide ? 1.10f : 0.96f;
+            case ArmyRole::Defense:
+                return attackerSide ? 0.82f : 1.14f;
+            case ArmyRole::Reserve:
+                return attackerSide ? 0.94f : 1.04f;
+        }
+        return 1.0f;
+    };
+
+    auto adjacentSupportStrength = [&](KingdomID owner, bool attackerSide) {
+        if (ctx.battleTile == NO_TILE ||
+            ctx.battleTile >= static_cast<TileID>(worldMap.tileCount())) {
+            return 0.0f;
+        }
+
+        float support = 0.0f;
+        int supportCount = 0;
+        for (TileID nid : worldMap.neighbors8(ctx.battleTile)) {
+            const Tile& tile = worldMap.at(nid);
+            if (tile.army == NO_ARMY) continue;
+            auto ait = armies.find(tile.army);
+            if (ait == armies.end()) continue;
+            const Army& army = ait->second;
+            if (army.owner != owner || army.isEmpty()) continue;
+            if (army.id == ctx.attackerArmy || army.id == ctx.defenderArmy) continue;
+            if (army.supplyLevel < 0.18f) continue;
+
+            const float roleFactor =
+                roleTacticalMultiplier(army.role, attackerSide, ctx.isSiege);
+            const float terrainFit = attackerSide
+                ? ((tile.terrain == TerrainType::Plain || tile.terrain == TerrainType::River) ? 1.08f :
+                   (tile.terrain == TerrainType::Hill || tile.terrain == TerrainType::Forest) ? 0.98f :
+                   tile.terrain == TerrainType::Mountain ? 0.88f : 1.0f)
+                : ((tile.terrain == TerrainType::Hill || tile.terrain == TerrainType::Forest) ? 1.12f :
+                   tile.terrain == TerrainType::Mountain ? 1.20f :
+                   tile.terrain == TerrainType::River ? 1.06f : 1.0f);
+            support += army.combatStrength(tile.terrain, !attackerSide) *
+                       std::clamp(army.supplyLevel, 0.25f, 1.0f) *
+                       roleFactor * terrainFit;
+            ++supportCount;
+            if (supportCount >= 3) break;
+        }
+
+        const float supportShare = attackerSide ? 0.24f : 0.28f;
+        return support * supportShare;
+    };
+
+    atkStr *= roleTacticalMultiplier(attacker.role, true, ctx.isSiege);
+    atkStr *= leaderCombatMultiplier(attacker, true, ctx.isSiege, ctx.terrain);
+    atkStr *= strategistCombatMultiplier(attacker, true, ctx.isSiege, ctx.terrain);
+    atkStr += adjacentSupportStrength(ctx.attackerKingdom, true);
 
     switch (ctx.season) {
         case Season::Spring: atkStr *= 1.08f; break;  // invasion season
@@ -234,6 +391,52 @@ BattleResult BattleEngine::resolveBattle(
          constants::RANDOM_COMBAT_FACTOR
     );
 
+    if (ctx.isSiege && ctx.defenderKingdom == NO_KINGDOM) {
+        result.attackerStrength = atkStr;
+        result.defenderStrength = 1.0f;
+        result.cityConquered = true;
+        result.conqueredCity = ctx.contestedCity;
+        result.victor = ctx.attackerKingdom;
+        result.loser = NO_KINGDOM;
+        result.attackerCasualties = 0.01f;
+        result.defenderCasualties = 0.0f;
+        result.attackerMoraleChange = 0.06f;
+        result.defenderMoraleChange = 0.0f;
+        return result;
+    }
+
+    // ── 民衆疲弊による無血開城 (ターン3000以降) ────────────────────────────
+    // 長年の戦乱で疲弊した国は、守備軍なしの城市を無抵抗で明け渡す。
+    // 首都は民心が残るため warWeariness 0.75 以上が必要。
+    if (ctx.isSiege && ctx.turn >= 3000 &&
+        kingdoms.count(ctx.defenderKingdom) && cities.count(ctx.contestedCity)) {
+        const Kingdom& defender = kingdoms.at(ctx.defenderKingdom);
+        City&          city     = cities.at(ctx.contestedCity);
+        const float    wearThreshold = city.isCapital ? 0.75f : 0.42f;
+        if (defender.warWeariness >= wearThreshold) {
+            // 攻城側の進捗リセット (次の攻城で引き継がないよう)
+            Army& attackerArmy = armies.at(ctx.attackerArmy);
+            attackerArmy.siegeProgress = 0.0f;
+            attackerArmy.siegeTarget   = NO_CITY;
+            // 城市の籠城状態リセット
+            city.siegeTurns      = 0;
+            city.siegeFoodStores = 1.0f;
+
+            result.attackerStrength    = atkStr;
+            result.defenderStrength    = 1.0f;
+            result.cityConquered       = true;
+            result.conqueredCity       = ctx.contestedCity;
+            result.victor              = ctx.attackerKingdom;
+            result.loser               = ctx.defenderKingdom;
+            result.attackerCasualties  = 0.0f;
+            result.defenderCasualties  = 0.0f;
+            result.attackerMoraleChange = 0.04f;
+            result.defenderMoraleChange = -0.06f;
+            result.capitulated         = true;
+            return result;
+        }
+    }
+
     float defStr = 1.0f;
 
     if (ctx.isSiege) {
@@ -249,6 +452,7 @@ BattleResult BattleEngine::resolveBattle(
 
         defStr = baseGarrison + populationDefense + fortDefense;
         defStr *= kingdoms.at(ctx.defenderKingdom).defenseBonus;
+        defStr += adjacentSupportStrength(ctx.defenderKingdom, false);
         if (ctx.season == Season::Winter) {
             defStr *= 1.12f;  // winter favors prepared defenders
         }
@@ -259,6 +463,10 @@ BattleResult BattleEngine::resolveBattle(
 
         defStr = defender.combatStrength(ctx.terrain, true);
         defStr *= kingdoms.at(ctx.defenderKingdom).defenseBonus;
+        defStr *= roleTacticalMultiplier(defender.role, false, false);
+        defStr *= leaderCombatMultiplier(defender, false, false, ctx.terrain);
+        defStr *= strategistCombatMultiplier(defender, false, false, ctx.terrain);
+        defStr += adjacentSupportStrength(ctx.defenderKingdom, false);
 
         if (kingdoms.at(ctx.attackerKingdom).personality == KingdomPersonality::Opportunistic &&
             defender.supplyLevel < 0.55f) {
@@ -326,6 +534,10 @@ BattleResult BattleEngine::resolveBattle(
                              * 0.10f
                              / (1.0f + city.fortification * 4.5f);
         if (hasSiegeAdvantage)  progressRate *= 1.6f;
+        if (attacker.hasStrategist()) {
+            const float wound = attacker.strategist.wounded ? 0.55f : 1.0f;
+            progressRate *= 1.0f + (attacker.strategist.siege - 1.0f) * 0.80f * wound;
+        }
         if (aggressiveAttacker) progressRate *= 1.25f;
         if (kingdoms.count(ctx.attackerKingdom) &&
             kingdoms.at(ctx.attackerKingdom).personality == KingdomPersonality::Opportunistic) {
@@ -368,7 +580,14 @@ BattleResult BattleEngine::resolveBattle(
             }
         }
 
-        bool capitalProtected = city.isCapital && importantHoldings >= 2;
+        const bool finalWarAttacker =
+            kingdoms.count(ctx.attackerKingdom) &&
+            kingdoms.at(ctx.attackerKingdom).policy == NationalPolicy::FinalWar;
+        bool capitalProtected =
+            city.isCapital &&
+            importantHoldings >= 2 &&
+            ctx.turn < 1600 &&
+            !finalWarAttacker;
 
         // Complete siege when progress reaches 1.0 or food runs out entirely
         bool siegeComplete = !capitalProtected &&
@@ -403,13 +622,28 @@ BattleResult BattleEngine::resolveBattle(
     if (attackerWins) {
         result.attackerCasualties = 0.05f + (1.0f / ratio) * 0.10f;
         result.defenderCasualties = 0.25f + std::min(0.50f, (ratio - 1.0f) * 0.30f);
+        result.defenderCasualties *= pursuitMultiplier(attacker);
+        if (ctx.defenderArmy != NO_ARMY && armies.count(ctx.defenderArmy)) {
+            result.defenderCasualties *= retreatCasualtyMultiplier(armies.at(ctx.defenderArmy));
+        }
     } else {
         result.attackerCasualties = 0.25f + std::min(0.50f, ((1.0f / ratio) - 1.0f) * 0.30f);
         result.defenderCasualties = 0.05f + ratio * 0.08f;
+        if (ctx.defenderArmy != NO_ARMY && armies.count(ctx.defenderArmy)) {
+            result.attackerCasualties *= pursuitMultiplier(armies.at(ctx.defenderArmy));
+        }
+        result.attackerCasualties *= retreatCasualtyMultiplier(attacker);
     }
 
     result.attackerMoraleChange = attackerWins ? 0.08f : -0.15f;
     result.defenderMoraleChange = attackerWins ? -0.15f : 0.08f;
+    if (attacker.hasCommander()) {
+        result.attackerMoraleChange += (attacker.commander.morale - 1.0f) * 0.10f;
+    }
+    if (ctx.defenderArmy != NO_ARMY && armies.count(ctx.defenderArmy) &&
+        armies.at(ctx.defenderArmy).hasCommander()) {
+        result.defenderMoraleChange += (armies.at(ctx.defenderArmy).commander.morale - 1.0f) * 0.10f;
+    }
 
     if (ctx.season == Season::Summer) {
         result.attackerCasualties *= 1.25f;
@@ -459,6 +693,131 @@ void BattleEngine::applyResult(
         }
     };
 
+    auto updateArmyLeaders = [&](Army& army, bool won, float casualties) {
+        const float experienceGain = won ? 0.040f : 0.018f;
+        const float fameGain = won ? 0.055f : 0.012f;
+        const float woundChance = std::clamp(casualties * 0.45f, 0.0f, 0.22f);
+        const float deathChance = std::clamp(casualties * 0.16f, 0.0f, 0.08f);
+        auto kingdomName = [&]() {
+            auto kit = kingdoms.find(army.owner);
+            return kit != kingdoms.end() ? kit->second.name : std::string("Unknown forces");
+        };
+        auto emitLeaderEvent = [&](EventType type, const std::string& description, float severity) {
+            HistoryEvent ev;
+            ev.type = type;
+            ev.turn = turn;
+            ev.primaryKingdom = army.owner;
+            ev.relatedArmy = army.id;
+            ev.description = description;
+            ev.context["severity"] = severity;
+            bus.emit(std::move(ev));
+        };
+        auto fameRank = [](float oldFame, float newFame, std::string_view role) {
+            if (oldFame < 0.25f && newFame >= 0.25f) {
+                return std::string("has earned notice as a rising ") + std::string(role) + ".";
+            }
+            if (oldFame < 0.38f && newFame >= 0.38f) {
+                return std::string("has become a distinguished ") + std::string(role) + ".";
+            }
+            if (oldFame < 0.52f && newFame >= 0.52f) {
+                return std::string("has become a renowned ") + std::string(role) + ".";
+            }
+            if (oldFame < 0.68f && newFame >= 0.68f) {
+                return std::string("is now counted among the legendary ") + std::string(role) + "s.";
+            }
+            return std::string{};
+        };
+
+        if (army.commander.alive) {
+            const float oldFame = army.commander.fame;
+            const bool wasWounded = army.commander.wounded;
+            army.commander.experience = std::min(1.0f, army.commander.experience + experienceGain);
+            army.commander.fame = std::min(1.0f, army.commander.fame + fameGain);
+            if (!army.commander.fameEventLogged &&
+                fameRank(oldFame, army.commander.fame, "commander").empty()) {
+                emitLeaderEvent(
+                    EventType::WorldEventPositive,
+                    army.commander.name + " of " + kingdomName() + " " +
+                        (won ? "won early fame as a battle-tested commander."
+                             : "earned grim fame as a hard-tested commander."),
+                    army.commander.fame);
+                army.commander.fameEventLogged = true;
+            }
+            if (army.commander.wounded && won && rng_.chance(0.18f)) army.commander.wounded = false;
+            if (rng_.chance(deathChance)) {
+                const std::string name = army.commander.name;
+                army.commander.alive = false;
+                army.commander.wounded = false;
+                emitLeaderEvent(
+                    EventType::WorldEventNegative,
+                    name + " of " + kingdomName() + " was slain in battle after earning grim fame.",
+                    1.0f);
+            } else if (rng_.chance(woundChance)) {
+                army.commander.wounded = true;
+            }
+            if (army.commander.alive && !wasWounded && army.commander.wounded) {
+                emitLeaderEvent(
+                    EventType::WorldEventNegative,
+                    army.commander.name + " of " + kingdomName() +
+                        " was wounded in battle, and the army now speaks of the commander's name.",
+                    0.55f);
+            }
+            std::string rank = fameRank(oldFame, army.commander.fame, "commander");
+            if (army.commander.alive && !rank.empty()) {
+                emitLeaderEvent(
+                    EventType::WorldEventPositive,
+                    army.commander.name + " of " + kingdomName() + " " + rank,
+                    army.commander.fame);
+                army.commander.fameEventLogged = true;
+            }
+        }
+
+        if (army.strategist.alive) {
+            const float oldFame = army.strategist.fame;
+            const bool wasWounded = army.strategist.wounded;
+            army.strategist.experience = std::min(1.0f, army.strategist.experience + experienceGain * 0.90f);
+            army.strategist.fame = std::min(1.0f, army.strategist.fame + fameGain * 0.85f);
+            if (!army.strategist.fameEventLogged &&
+                fameRank(oldFame, army.strategist.fame, "strategist").empty()) {
+                emitLeaderEvent(
+                    EventType::WorldEventPositive,
+                    army.strategist.name + " of " + kingdomName() + " " +
+                        (won ? "won early fame as a battle-tested strategist."
+                             : "earned grim fame as a hard-tested strategist."),
+                    army.strategist.fame);
+                army.strategist.fameEventLogged = true;
+            }
+            if (army.strategist.wounded && won && rng_.chance(0.20f)) army.strategist.wounded = false;
+            if (rng_.chance(deathChance * 0.65f)) {
+                const std::string name = army.strategist.name;
+                army.strategist.alive = false;
+                army.strategist.wounded = false;
+                emitLeaderEvent(
+                    EventType::WorldEventNegative,
+                    name + " of " + kingdomName() +
+                        " was killed while directing the battle after earning grim fame.",
+                    0.9f);
+            } else if (rng_.chance(woundChance * 0.70f)) {
+                army.strategist.wounded = true;
+            }
+            if (army.strategist.alive && !wasWounded && army.strategist.wounded) {
+                emitLeaderEvent(
+                    EventType::WorldEventNegative,
+                    army.strategist.name + " of " + kingdomName() +
+                        " was wounded while directing the battle, spreading the strategist's fame.",
+                    0.50f);
+            }
+            std::string rank = fameRank(oldFame, army.strategist.fame, "strategist");
+            if (army.strategist.alive && !rank.empty()) {
+                emitLeaderEvent(
+                    EventType::WorldEventPositive,
+                    army.strategist.name + " of " + kingdomName() + " " + rank,
+                    army.strategist.fame);
+                army.strategist.fameEventLogged = true;
+            }
+        }
+    };
+
     auto retreatArmy = [&](Army& army) {
         TileID from = army.currentTile;
         TileID retreatTile = NO_TILE;
@@ -499,6 +858,7 @@ void BattleEngine::applyResult(
     if (armies.count(result.attackerArmy)) {
         Army& atk = armies.at(result.attackerArmy);
         applyArmyDamage(atk, result.attackerCasualties, result.attackerMoraleChange);
+        updateArmyLeaders(atk, result.victor == atk.owner, result.attackerCasualties);
 
         if (result.attackerRetreated) {
             retreatArmy(atk);
@@ -508,6 +868,7 @@ void BattleEngine::applyResult(
     if (result.defenderArmy != NO_ARMY && armies.count(result.defenderArmy)) {
         Army& def = armies.at(result.defenderArmy);
         applyArmyDamage(def, result.defenderCasualties, result.defenderMoraleChange);
+        updateArmyLeaders(def, result.victor == def.owner, result.defenderCasualties);
 
         if (result.defenderRetreated) {
             retreatArmy(def);
@@ -528,7 +889,15 @@ void BattleEngine::applyResult(
             );
 
             if (kingdoms.at(oldOwner).capitalCity == result.conqueredCity) {
-                const bool lateSmallStateCollapse = turn >= 250 && oldCities.size() <= 2;
+                int capitalCollapseCityLimit = 0;
+                if (turn >= 250)  capitalCollapseCityLimit = 2;
+                if (turn >= 900)  capitalCollapseCityLimit = 4;
+                if (turn >= 1500) capitalCollapseCityLimit = 8;
+                if (turn >= 2200) capitalCollapseCityLimit = 14;
+                if (turn >= 2600) capitalCollapseCityLimit = 100000;
+                const bool lateSmallStateCollapse =
+                    capitalCollapseCityLimit > 0 &&
+                    oldCities.size() <= static_cast<size_t>(capitalCollapseCityLimit);
 
                 kingdoms.at(oldOwner).capitalCity =
                     (oldCities.empty() || lateSmallStateCollapse) ? NO_CITY : oldCities.front();
@@ -644,12 +1013,15 @@ void BattleEngine::applyResult(
 
             worldMap.at(city.tile).owner = newOwner;
 
-            // Take nearby tiles around conquered city
-            TileID cnbs[4]; int cnCount = worldMap.neighbors4(city.tile, cnbs);
-            for (int cni = 0; cni < cnCount; ++cni) { TileID neighbor = cnbs[cni];
-                Tile& nt = worldMap.at(neighbor);
-                if (isClaimableTerritory(nt.terrain) &&
-                    (nt.owner == oldOwner || nt.owner == NO_KINGDOM)) {
+            const auto center = worldMap.at(city.tile).position;
+            const float radius = conquestRadiusTiles(city);
+            const float radiusSq = radius * radius;
+            for (Tile& nt : worldMap.tiles()) {
+                if (!isClaimableTerritory(nt.terrain)) continue;
+                if (nt.owner != oldOwner && nt.owner != NO_KINGDOM) continue;
+                const float dx = static_cast<float>(nt.position.x - center.x);
+                const float dy = static_cast<float>(nt.position.y - center.y);
+                if (dx * dx + dy * dy <= radiusSq) {
                     nt.owner = newOwner;
                 }
             }
@@ -663,25 +1035,32 @@ void BattleEngine::applyResult(
             std::string fromStr = (oldOwner == NO_KINGDOM)
                 ? "independent forces"
                 : kingdoms.at(oldOwner).name;
-            ev.description =
-                kingdoms.at(newOwner).name + " conquered " +
-                city.name + " from " + fromStr + ".";
+            ev.description = result.capitulated
+                ? kingdoms.at(newOwner).name + " — " + city.name +
+                  " opened its gates without resistance. (" + fromStr + " exhausted)"
+                : kingdoms.at(newOwner).name + " conquered " +
+                  city.name + " from " + fromStr + ".";
             bus.emit(std::move(ev));
         }
     }
 
-    HistoryEvent battleEv;
-    battleEv.type = EventType::BattleFought;
-    battleEv.turn = turn;
-    battleEv.primaryKingdom = result.victor;
-    battleEv.secondaryKingdom = result.loser;
-    battleEv.description =
-        kingdoms.at(result.victor).name + " defeated " +
-        kingdoms.at(result.loser).name + " in battle.";
-    battleEv.context["attacker_strength"] = result.attackerStrength;
-    battleEv.context["defender_strength"] = result.defenderStrength;
+    if (!result.capitulated &&
+        result.loser != NO_KINGDOM &&
+        kingdoms.count(result.victor) &&
+        kingdoms.count(result.loser)) {
+        HistoryEvent battleEv;
+        battleEv.type = EventType::BattleFought;
+        battleEv.turn = turn;
+        battleEv.primaryKingdom = result.victor;
+        battleEv.secondaryKingdom = result.loser;
+        battleEv.description =
+            kingdoms.at(result.victor).name + " defeated " +
+            kingdoms.at(result.loser).name + " in battle.";
+        battleEv.context["attacker_strength"] = result.attackerStrength;
+        battleEv.context["defender_strength"] = result.defenderStrength;
 
-    bus.emit(std::move(battleEv));
+        bus.emit(std::move(battleEv));
+    }
 
     if (kingdoms.count(result.loser)) {
         Kingdom& loser = kingdoms.at(result.loser);

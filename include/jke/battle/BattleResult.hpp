@@ -14,6 +14,7 @@ struct BattleResult {
     float     defenderMoraleChange = 0.0f;
     bool      cityConquered        = false;
     CityID    conqueredCity        = NO_CITY;
+    bool      capitulated          = false;  // 無血開城 (民衆疲弊による)
     bool      attackerRetreated    = false;
     bool      defenderRetreated    = false;
     EventID   historyEventID       = 0;

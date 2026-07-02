@@ -1,6 +1,8 @@
 #include "jke/SimulationEngine.hpp"
 #include <algorithm>
 #include <cmath>
+#include <queue>
+#include <unordered_map>
 
 namespace jke {
 
@@ -245,30 +247,69 @@ FleetID SimulationEngine::buildFleet(KingdomID owner, CityID portCity) {
 }
 
 void SimulationEngine::updateNavy() {
-    constexpr float FLEET_BUILD_GOLD = 200.0f;
-    constexpr float FLEET_BUILD_WOOD = 150.0f;
-    constexpr float FLEET_UPKEEP     = 4.0f;    // gold per turn
-    constexpr int   FLEET_MOVE_CD    = 2;        // turns between moves
-    constexpr int   FLEET_MOVE_RANGE = 4;        // coast tiles per move action
+    constexpr float    FLEET_BUILD_GOLD  = 200.0f;
+    constexpr float    FLEET_BUILD_WOOD  = 150.0f;
+    constexpr float    FLEET_UPKEEP      = 4.0f;
+    constexpr int      FLEET_MOVE_CD     = 2;
+    constexpr int      FLEET_MOVE_RANGE  = 4;
+    constexpr uint32_t FLEET_HULL_COMBAT = 150;  // hull damage per naval combat exchange
+
+    const int W = static_cast<int>(worldMap_.width());
+    const int H = static_cast<int>(worldMap_.height());
+
+    auto atWar = [&](KingdomID a, KingdomID b) -> bool {
+        KingdomID lo = std::min(a, b), hi = std::max(a, b);
+        return relations_.count(lo) && relations_.at(lo).count(hi) &&
+               relations_.at(lo).at(hi).state == RelationState::War;
+    };
+
+    // BFS coastal pathfinding: returns next coast/ocean tile to step onto from `from`
+    // toward `to`. Returns NO_TILE if unreachable within LIMIT nodes.
+    auto bfsCoastStep = [&](TileID from, TileID to) -> TileID {
+        if (from == to || from == NO_TILE || to == NO_TILE) return from;
+        constexpr int LIMIT = 1500;
+        const int ddx[] = {0, 0, -1, 1};
+        const int ddy[] = {-1, 1, 0, 0};
+        std::unordered_map<TileID, TileID> parent;
+        std::queue<TileID> q;
+        parent[from] = from;
+        q.push(from);
+        int visited = 0;
+        while (!q.empty() && visited < LIMIT) {
+            TileID cur = q.front(); q.pop();
+            ++visited;
+            if (cur == to) {
+                TileID step = to;
+                while (parent.at(step) != from) step = parent.at(step);
+                return step;
+            }
+            int cx = static_cast<int>(cur) % W, cy = static_cast<int>(cur) / W;
+            for (int i = 0; i < 4; ++i) {
+                int nx = cx + ddx[i], ny = cy + ddy[i];
+                if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+                TileID nt = static_cast<TileID>(ny * W + nx);
+                if (!isCoastalTile(nt) || parent.count(nt)) continue;
+                parent[nt] = cur;
+                q.push(nt);
+            }
+        }
+        return NO_TILE;
+    };
 
     // ── 1. Build fleets at Port cities (AI decision) ─────────────────────────
     for (auto& [kid, k] : kingdoms_) {
         if (!k.isAlive) continue;
-        // Count existing fleets
         int ownFleets = 0;
         for (const auto& [fid, fl] : fleets_) if (fl.owner == kid) ownFleets++;
 
-        // Port city kingdoms can build 1 fleet per 2 Port cities
         int portCount = 0;
-        for (CityID cid : k.cities) {
+        for (CityID cid : k.cities)
             if (cities_.count(cid) && cities_.at(cid).cityType == CityType::Port) portCount++;
-        }
         int maxFleets = portCount / 2 + (portCount > 0 ? 1 : 0);
         if (portCount == 0 || ownFleets >= maxFleets) continue;
         if (k.treasury.gold < FLEET_BUILD_GOLD || k.treasury.wood < FLEET_BUILD_WOOD) continue;
         if (!rng_.chance(0.08f)) continue;
 
-        // Pick a Port city without an assigned fleet
         for (CityID cid : k.cities) {
             if (!cities_.count(cid) || cities_.at(cid).cityType != CityType::Port) continue;
             bool hasFleet = false;
@@ -292,139 +333,207 @@ void SimulationEngine::updateNavy() {
     }
 
     // ── 2. Upkeep & sink fleets of dead kingdoms ────────────────────────────
-    std::vector<FleetID> toSink;
-    for (auto& [fid, fl] : fleets_) {
-        if (!kingdoms_.count(fl.owner) || !kingdoms_.at(fl.owner).isAlive) {
-            toSink.push_back(fid);
-            continue;
+    {
+        std::vector<FleetID> toSink;
+        for (auto& [fid, fl] : fleets_) {
+            if (!kingdoms_.count(fl.owner) || !kingdoms_.at(fl.owner).isAlive) {
+                toSink.push_back(fid);
+                continue;
+            }
+            kingdoms_.at(fl.owner).treasury.gold -= FLEET_UPKEEP;
         }
-        kingdoms_.at(fl.owner).treasury.gold -= FLEET_UPKEEP;
+        for (FleetID fid : toSink) fleets_.erase(fid);
     }
-    for (FleetID fid : toSink) fleets_.erase(fid);
 
     // ── 3. Sink fleets whose home port was captured ─────────────────────────
-    toSink.clear();
-    for (auto& [fid, fl] : fleets_) {
-        auto cit = cities_.find(fl.homePort);
-        if (fl.homePort == NO_CITY || cit == cities_.end()) continue;
-        if (cit->second.owner != fl.owner) toSink.push_back(fid);
-    }
-    for (FleetID fid : toSink) {
-        auto fit = fleets_.find(fid);
-        if (fit == fleets_.end()) continue;
-        // Disembark cargo if any
-        if (fit->second.cargo != NO_ARMY) {
-            ArmyID aid = fit->second.cargo;
-            auto ait = armies_.find(aid);
-            if (ait != armies_.end()) {
-                ait->second.currentTile = fit->second.tile;
-                ait->second.isBesieging = false;
-            }
+    {
+        std::vector<FleetID> toSink;
+        for (auto& [fid, fl] : fleets_) {
+            auto cit = cities_.find(fl.homePort);
+            if (fl.homePort == NO_CITY || cit == cities_.end()) continue;
+            if (cit->second.owner != fl.owner) toSink.push_back(fid);
         }
-        fleets_.erase(fit);
+        for (FleetID fid : toSink) {
+            auto fit = fleets_.find(fid);
+            if (fit == fleets_.end()) continue;
+            if (fit->second.cargo != NO_ARMY && armies_.count(fit->second.cargo))
+                armies_.at(fit->second.cargo).currentTile = fit->second.tile;
+            fleets_.erase(fit);
+        }
     }
 
-    // ── 4. Move fleets (basic AI: find enemy coast, transport army) ──────────
-    const int W = static_cast<int>(worldMap_.width());
-    for (auto& [fid, fl] : fleets_) {
-        if (fl.moveCd > 0) { fl.moveCd--; continue; }
-        Kingdom& k = kingdoms_.at(fl.owner);
+    // ── Naval combat: fleets from warring kingdoms on adjacent tiles exchange fire ──
+    {
+        std::vector<FleetID> ids;
+        ids.reserve(fleets_.size());
+        for (const auto& [fid, _] : fleets_) ids.push_back(fid);
 
-        // Find the active war enemy
-        KingdomID enemy = NO_KINGDOM;
-        for (const auto& [eid, ek] : kingdoms_) {
-            if (!ek.isAlive || eid == fl.owner) continue;
-            KingdomID lo = std::min(fl.owner, eid), hi = std::max(fl.owner, eid);
-            if (relations_.count(lo) && relations_.at(lo).count(hi) &&
-                relations_.at(lo).at(hi).state == RelationState::War) {
-                enemy = eid;
-                break;
-            }
-        }
-        if (enemy == NO_KINGDOM) continue;
+        for (size_t i = 0; i < ids.size(); ++i) {
+            if (!fleets_.count(ids[i])) continue;
+            Fleet& fa = fleets_.at(ids[i]);
+            if (fa.hull == 0) continue;
+            int ax = static_cast<int>(fa.tile) % W, ay = static_cast<int>(fa.tile) / W;
 
-        // If empty, try to embark a nearby army
-        if (fl.cargo == NO_ARMY) {
-            for (ArmyID aid : k.armies) {
-                auto ait2 = armies_.find(aid);
-                if (ait2 == armies_.end()) continue;
-                auto& army = ait2->second;
-                TileID at = army.currentTile;
-                if (at == NO_TILE || at >= static_cast<TileID>(worldMap_.tileCount())) continue;
-                // Army must be adjacent to fleet tile
-                int ax = static_cast<int>(at) % W, ay = static_cast<int>(at) / W;
-                int fx = static_cast<int>(fl.tile) % W, fy = static_cast<int>(fl.tile) / W;
-                int dist = std::abs(ax - fx) + std::abs(ay - fy);
-                if (dist <= 2 && army.role == ArmyRole::Attack) {
-                    fl.cargo = aid;
-                    army.currentTile = fl.tile; // army moves onto fleet
-                    fl.inPort = false;
-                    break;
-                }
-            }
-            if (fl.cargo == NO_ARMY) continue;
-        }
+            for (size_t j = i + 1; j < ids.size(); ++j) {
+                if (!fleets_.count(ids[j])) continue;
+                Fleet& fb = fleets_.at(ids[j]);
+                if (fb.hull == 0) continue;
+                if (fa.owner == fb.owner || !atWar(fa.owner, fb.owner)) continue;
 
-        // Navigate toward nearest enemy coast tile
-        TileID bestTile = NO_TILE;
-        int bestScore = INT_MAX;
-        for (const auto& [ecid, ec] : cities_) {
-            if (ec.owner != enemy) continue;
-            TileID coast = findAdjacentCoast(ec.tile);
-            if (coast == NO_TILE) continue;
-            int cx = static_cast<int>(coast) % W, cy = static_cast<int>(coast) / W;
-            int fx = static_cast<int>(fl.tile) % W, fy = static_cast<int>(fl.tile) / W;
-            int d = std::abs(cx - fx) + std::abs(cy - fy);
-            if (d < bestScore) { bestScore = d; bestTile = coast; }
-        }
-        if (bestTile == NO_TILE) continue;
+                int bx = static_cast<int>(fb.tile) % W, by = static_cast<int>(fb.tile) / W;
+                if (std::max(std::abs(ax - bx), std::abs(ay - by)) > 1) continue;
 
-        // Move toward target (up to FLEET_MOVE_RANGE steps along coast/ocean)
-        int tx = static_cast<int>(bestTile) % W, ty = static_cast<int>(bestTile) / W;
-        int fx = static_cast<int>(fl.tile) % W, fy = static_cast<int>(fl.tile) / W;
-        int steps = 0;
-        for (; steps < FLEET_MOVE_RANGE && (fx != tx || fy != ty); ++steps) {
-            int ndx = (tx > fx) ? 1 : (tx < fx) ? -1 : 0;
-            int ndy = (ty > fy) ? 1 : (ty < fy) ? -1 : 0;
-            // Prefer coast movement, try horizontal then vertical
-            auto tryStep = [&](int ddx, int ddy) -> bool {
-                int nx = fx + ddx, ny = fy + ddy;
-                if (nx < 0 || ny < 0 || nx >= W || ny >= static_cast<int>(worldMap_.height())) return false;
-                TileID nt = static_cast<TileID>(ny * W + nx);
-                if (!isCoastalTile(nt)) return false;
-                fx = nx; fy = ny;
-                fl.tile = nt;
-                return true;
-            };
-            if (!tryStep(ndx, ndy)) {
-                if (!tryStep(ndx, 0)) tryStep(0, ndy);
-            }
-        }
+                uint32_t dmgA = FLEET_HULL_COMBAT + rng_.nextInt(0, 50);
+                uint32_t dmgB = FLEET_HULL_COMBAT + rng_.nextInt(0, 50);
+                fa.hull = (fa.hull > dmgB) ? fa.hull - dmgB : 0;
+                fb.hull = (fb.hull > dmgA) ? fb.hull - dmgA : 0;
 
-        // Disembark army if adjacent to enemy city
-        if (fl.cargo != NO_ARMY) {
-            for (const auto& [ecid, ec] : cities_) {
-                if (ec.owner != enemy) continue;
-                int cx = static_cast<int>(ec.tile) % W, cy = static_cast<int>(ec.tile) / W;
-                int dist = std::abs(cx - fx) + std::abs(cy - fy);
-                if (dist <= 3) {
-                    // Disembark
-                    if (armies_.count(fl.cargo)) {
-                        armies_.at(fl.cargo).currentTile = fl.tile;
-                        armies_.at(fl.cargo).targetTile  = ec.tile;
-                        armies_.at(fl.cargo).role        = ArmyRole::Attack;
-                    }
-                    fl.cargo  = NO_ARMY;
-                    fl.inPort = false;
-
+                if (fb.hull == 0) {
                     HistoryEvent ev;
-                    ev.type           = EventType::WorldEventNegative;
-                    ev.turn           = currentTurn_;
-                    ev.primaryKingdom = fl.owner;
-                    ev.description    = k.name + "'s fleet landed troops near " + ec.name + "!";
+                    ev.type = EventType::WorldEventNegative; ev.turn = currentTurn_;
+                    ev.primaryKingdom = fa.owner;
+                    ev.description = kingdoms_.at(fa.owner).name + "'s fleet sank an enemy vessel!";
+                    eventBus_.emit(std::move(ev));
+                }
+                if (fa.hull == 0) {
+                    HistoryEvent ev;
+                    ev.type = EventType::WorldEventNegative; ev.turn = currentTurn_;
+                    ev.primaryKingdom = fb.owner;
+                    ev.description = kingdoms_.at(fb.owner).name + "'s fleet sank an enemy vessel!";
                     eventBus_.emit(std::move(ev));
                     break;
                 }
+            }
+        }
+
+        // Remove sunk fleets; disembark cargo onto the tile they sank on
+        for (auto it = fleets_.begin(); it != fleets_.end(); ) {
+            if (it->second.hull == 0) {
+                if (it->second.cargo != NO_ARMY && armies_.count(it->second.cargo))
+                    armies_.at(it->second.cargo).currentTile = it->second.tile;
+                it = fleets_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // Track armies already embarked this turn to prevent double-embarkation
+    std::unordered_set<ArmyID> embarkedThisTurn;
+    for (const auto& [fid, fl] : fleets_)
+        if (fl.cargo != NO_ARMY) embarkedThisTurn.insert(fl.cargo);
+
+    // ── 4. Move fleets ───────────────────────────────────────────────────────
+    for (auto& [fid, fl] : fleets_) {
+        if (fl.moveCd > 0) { fl.moveCd--; continue; }
+        if (!kingdoms_.count(fl.owner)) continue;
+        Kingdom& k = kingdoms_.at(fl.owner);
+
+        // Determine war enemy
+        KingdomID enemy = NO_KINGDOM;
+        for (const auto& [eid, ek] : kingdoms_) {
+            if (!ek.isAlive || eid == fl.owner) continue;
+            if (atWar(fl.owner, eid)) { enemy = eid; break; }
+        }
+
+        // ── Peace-time: patrol between own port coast tiles ───────────────
+        if (enemy == NO_KINGDOM) {
+            std::vector<TileID> portTiles;
+            for (CityID cid : k.cities) {
+                if (!cities_.count(cid) || cities_.at(cid).cityType != CityType::Port) continue;
+                TileID coast = findAdjacentCoast(cities_.at(cid).tile);
+                if (coast != NO_TILE) portTiles.push_back(coast);
+            }
+            if (portTiles.size() >= 2) {
+                size_t slot = (static_cast<size_t>(fid) + static_cast<size_t>(currentTurn_) / 4)
+                              % portTiles.size();
+                TileID patrol = portTiles[slot];
+                if (fl.tile == patrol) patrol = portTiles[(slot + 1) % portTiles.size()];
+                TileID step = bfsCoastStep(fl.tile, patrol);
+                if (step != NO_TILE && step != fl.tile) fl.tile = step;
+            }
+            fl.moveCd = FLEET_MOVE_CD;
+            continue;
+        }
+
+        // Find nearest enemy coastal city (used for both empty and loaded fleets)
+        TileID bestCoast = NO_TILE;
+        {
+            int bestDist = INT_MAX;
+            int fx = static_cast<int>(fl.tile) % W, fy = static_cast<int>(fl.tile) / W;
+            for (const auto& [ecid, ec] : cities_) {
+                if (ec.owner != enemy) continue;
+                TileID coast = findAdjacentCoast(ec.tile);
+                if (coast == NO_TILE) continue;
+                int cx = static_cast<int>(coast) % W, cy = static_cast<int>(coast) / W;
+                int d = std::abs(cx - fx) + std::abs(cy - fy);
+                if (d < bestDist) { bestDist = d; bestCoast = coast; }
+            }
+        }
+
+        // ── War-time empty: move toward enemy coast to pick up armies ─────
+        if (fl.cargo == NO_ARMY) {
+            // Try to embark a nearby attack army (Chebyshev <= 8, no double-embark)
+            int fx = static_cast<int>(fl.tile) % W, fy = static_cast<int>(fl.tile) / W;
+            for (ArmyID aid : k.armies) {
+                if (embarkedThisTurn.count(aid)) continue;
+                auto ait = armies_.find(aid);
+                if (ait == armies_.end()) continue;
+                Army& army = ait->second;
+                if (army.currentTile == NO_TILE) continue;
+                int ax2 = static_cast<int>(army.currentTile) % W;
+                int ay2 = static_cast<int>(army.currentTile) / W;
+                int dist = std::max(std::abs(ax2 - fx), std::abs(ay2 - fy));
+                if (dist <= 8 &&
+                    (army.role == ArmyRole::Attack ||
+                     army.role == ArmyRole::Vanguard ||
+                     army.role == ArmyRole::Flanker)) {
+                    fl.cargo = aid;
+                    army.currentTile = fl.tile;
+                    fl.inPort = false;
+                    embarkedThisTurn.insert(aid);
+                    break;
+                }
+            }
+            // If still empty, advance toward enemy coast to be ready next turn
+            if (fl.cargo == NO_ARMY && bestCoast != NO_TILE) {
+                TileID step = bfsCoastStep(fl.tile, bestCoast);
+                if (step != NO_TILE && step != fl.tile) fl.tile = step;
+            }
+            fl.moveCd = FLEET_MOVE_CD;
+            continue;
+        }
+
+        if (bestCoast == NO_TILE) { fl.moveCd = FLEET_MOVE_CD; continue; }
+
+        // BFS navigate up to FLEET_MOVE_RANGE steps; disembark when Chebyshev <= 3 to enemy city
+        bool disembarked = false;
+        for (int s = 0; s < FLEET_MOVE_RANGE && !disembarked; ++s) {
+            TileID next = bfsCoastStep(fl.tile, bestCoast);
+            if (next == NO_TILE || next == fl.tile) break;
+            fl.tile = next;
+            if (armies_.count(fl.cargo)) armies_.at(fl.cargo).currentTile = fl.tile;
+
+            int nfx = static_cast<int>(fl.tile) % W, nfy = static_cast<int>(fl.tile) / W;
+            for (const auto& [ecid, ec] : cities_) {
+                if (ec.owner != enemy) continue;
+                int cx = static_cast<int>(ec.tile) % W, cy = static_cast<int>(ec.tile) / W;
+                if (std::max(std::abs(cx - nfx), std::abs(cy - nfy)) > 3) continue;
+                if (armies_.count(fl.cargo)) {
+                    armies_.at(fl.cargo).currentTile = fl.tile;
+                    armies_.at(fl.cargo).targetTile  = ec.tile;
+                    armies_.at(fl.cargo).role        = ArmyRole::Attack;
+                }
+                fl.cargo     = NO_ARMY;
+                fl.inPort    = false;
+                disembarked  = true;
+                HistoryEvent ev;
+                ev.type           = EventType::WorldEventNegative;
+                ev.turn           = currentTurn_;
+                ev.primaryKingdom = fl.owner;
+                ev.description    = k.name + "'s fleet landed troops near " + ec.name + "!";
+                eventBus_.emit(std::move(ev));
+                break;
             }
         }
         fl.moveCd = FLEET_MOVE_CD;

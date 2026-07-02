@@ -38,6 +38,8 @@ public:
 
     const std::vector<HistoryEvent>& pendingEvents() const { return queue_; }
 
+    void clearPending() { queue_.clear(); }
+
 private:
     std::unordered_map<int, std::vector<Handler>> handlers_;
     std::vector<Handler>                          catchAll_;

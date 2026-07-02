@@ -1,3 +1,12 @@
+// DiplomaticAI — 外交覇権型
+// 該当王国: Valdoria（盟主気取りの古い名家）, Sunhaven（温和な農業国）, Rivermark（川沿いの穏健国）
+//
+// 戦略方針:
+//   - 同盟ネットワークを構築し、外交的優位で覇権を維持する
+//   - 大国（覇権国）が台頭したら対抗同盟を組んでバランスを保つ
+//   - 直接戦争より同盟国を通じた間接的な圧力を好む
+//   - 極力消耗を避け、士気と安定を高水準に保つ
+
 #include "jke/ai/personalities/DiplomaticAI.hpp"
 #include <algorithm>
 

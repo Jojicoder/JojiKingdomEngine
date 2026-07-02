@@ -1,3 +1,12 @@
+// EconomicAI — 経済覇権型
+// 該当王国: Aethermoor（技術を売る研究国家）, Crystalholm（知識を独占する水晶の島国）, Silvershard（銀の商才で富む国）
+//
+// 戦略方針:
+//   - 内政・交易・技術開発を最優先。軍事は最低限に抑える
+//   - 金と資源が豊富になったら外交で他国を従属・同盟化する
+//   - FinalWar になれば経済力で蓄えた大軍を一気に投入
+//   - 弱体化した相手への限定侵攻で領土と資源を静かに広げる
+
 #include "jke/ai/personalities/EconomicAI.hpp"
 #include <algorithm>
 

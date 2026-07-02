@@ -173,8 +173,10 @@ struct CampaignPlan {
     float         reserveRatio        = 0.20f;
     float         retreatSupply       = 0.38f;
     float         commitThreshold     = 0.85f;
+    float         primaryCommitShare  = 0.58f;
     bool          supportAlly         = false;
     bool          diversion           = false;
+    bool          concentratedAssault = false;
     std::vector<CampaignFront> fronts;
     std::string   reason;
 

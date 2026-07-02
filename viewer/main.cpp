@@ -15,18 +15,14 @@
 #include <filesystem>
 #include <unordered_map>
 
-// ── Layout constants ──────────────────────────────────────────────────────────
+// ── Layout constants (fixed) ──────────────────────────────────────────────────
 constexpr int TILE_PX      = 6;
 constexpr int MAP_TILES    = 257;                        // 2^8+1 diamond-square
 constexpr int MAP_FULL_PX  = MAP_TILES * TILE_PX;       // 1542 — full map texture
-constexpr int VIEWPORT_PX  = 774;                        // visible area on screen (129 tiles)
 constexpr int MAP_OX       = 18;
-constexpr int WIN_H        = 860;
 constexpr int MAP_OY       = 62;
-constexpr int PANEL_X      = MAP_OX + VIEWPORT_PX + 22;
-constexpr int PANEL_W      = 386;
-constexpr int WIN_W        = PANEL_X + PANEL_W + 18;
-constexpr int MINIMAP_PX   = 160;                        // minimap display size in panel
+constexpr int MINIMAP_PX   = 190;
+constexpr int PANEL_W_MIN  = 380;                        // minimum panel width
 
 // ── Colors ────────────────────────────────────────────────────────────────────
 const sf::Color TERRAIN_COL[8] = {
@@ -40,11 +36,27 @@ const sf::Color TERRAIN_COL[8] = {
     { 44, 120, 115, 255}, // Lake
 };
 
-const sf::Color KINGDOM_COL[16] = {
-    {220,  60,  60}, {60,  110, 220}, {60,  185,  60}, {220, 165,  30},
-    {155,  60, 205}, {30,  185, 185}, {225, 125,  50}, { 90,  90, 140},
-    {205,  55, 135}, {55,  205, 205}, {135, 185,  55}, {205, 105,  55},
-    {105, 145, 165}, {205, 185,  55}, {145,  85,  55}, {105,  55, 185},
+const sf::Color KINGDOM_COL[20] = {
+    {220,  50,  50},  //  1 Red
+    { 50,  95, 215},  //  2 Royal Blue
+    {215, 120,  25},  //  3 Orange
+    {140,  30, 215},  //  4 Violet
+    { 40, 185,  60},  //  5 Green
+    {215,  30, 130},  //  6 Hot Pink
+    {215, 195,  25},  //  7 Yellow
+    { 25, 160, 215},  //  8 Sky Blue
+    {180, 215,  30},  //  9 Chartreuse
+    {130,  20,  40},  // 10 Maroon      (Crimsonより暗く赤と明確に区別)
+    { 30, 215, 120},  // 11 Spring Green (TurquoiseをB=120に変更→Cyanと明確に区別)
+    { 75,  25, 195},  // 12 Indigo
+    {215,  55,  95},  // 13 Rose        (FuchsiaをB=95に変更→Hot Pinkと区別)
+    {175,  90,  30},  // 14 Sienna      (Lime廃止→暖色系で緑系過多を解消)
+    {200, 145,  25},  // 15 Amber
+    {200,  30, 200},  // 16 Magenta
+    { 25,  45, 155},  // 17 Navy        (Emerald廃止→暗い青で地形と被らない)
+    { 25, 205, 205},  // 18 Cyan
+    {150,  80, 215},  // 19 Lavender
+    {215,  95,  60},  // 20 Coral
 };
 
 const sf::Color BG_COLOR     {14,  17,  24};
@@ -81,7 +93,7 @@ static sf::Color shade(sf::Color c, float amount) {
 
 static sf::Color kingdomColor(jke::KingdomID kid) {
     if (kid == jke::NO_KINGDOM) return sf::Color{40, 40, 50};
-    return KINGDOM_COL[(kid - 1) % 16];
+    return KINGDOM_COL[(kid - 1) % 20];
 }
 
 static bool isWaterTerrain(jke::TerrainType terrain) {
@@ -142,9 +154,10 @@ static sf::Font loadFont() {
 class Viewer {
 public:
     Viewer(jke::SimulationConfig cfg)
-        : window_(sf::VideoMode({WIN_W, WIN_H}), "JojiKingdomEngine",
-                  sf::Style::Close | sf::Style::Titlebar)
-        , engine_(cfg)
+        : window_(sf::VideoMode::getDesktopMode(), "JojiKingdomEngine",
+                  sf::Style::Default)
+        , config_(cfg)
+        , engine_(config_)
         , font_(loadFont())
         , mapTexture_(sf::Vector2u(MAP_FULL_PX, MAP_FULL_PX))
         , mapSprite_(mapTexture_)
@@ -152,19 +165,14 @@ public:
         , minimapSprite_(minimapTex_)
     {
         window_.setFramerateLimit(60);
-
-        // Map texture starts at world origin (0,0)
         mapSprite_.setPosition({0.f, 0.f});
 
-        // Map view: shows VIEWPORT_PX × VIEWPORT_PX world units
-        // centered initially at middle of the full map
+        computeLayout();
+
         camCenter_ = {MAP_FULL_PX / 2.f, MAP_FULL_PX / 2.f};
-        mapView_.setSize({static_cast<float>(VIEWPORT_PX), static_cast<float>(VIEWPORT_PX)});
+        mapView_.setSize({static_cast<float>(viewportW_), static_cast<float>(viewportH_)});
         mapView_.setCenter(camCenter_);
-        mapView_.setViewport(sf::FloatRect(
-            {static_cast<float>(MAP_OX) / WIN_W, static_cast<float>(MAP_OY) / WIN_H},
-            {static_cast<float>(VIEWPORT_PX) / WIN_W, static_cast<float>(VIEWPORT_PX) / WIN_H}
-        ));
+        updateMapViewport();
 
         engine_.initializeWorld_pub();
         rebuildMapImage();
@@ -181,6 +189,10 @@ public:
             // Camera pan with WASD (speed scales with zoom so it feels consistent)
             float dt = camClock_.restart().asSeconds();
             float panSpeed = 500.f / zoom_;
+            if (sf::Keyboard::isKeyPressed(sf::Keyboard::Key::LShift) ||
+                sf::Keyboard::isKeyPressed(sf::Keyboard::Key::RShift)) {
+                panSpeed *= 2.4f;
+            }
             if (sf::Keyboard::isKeyPressed(sf::Keyboard::Key::W)) camCenter_.y -= panSpeed * dt;
             if (sf::Keyboard::isKeyPressed(sf::Keyboard::Key::S)) camCenter_.y += panSpeed * dt;
             if (sf::Keyboard::isKeyPressed(sf::Keyboard::Key::A)) camCenter_.x -= panSpeed * dt;
@@ -207,7 +219,35 @@ public:
     }
 
 private:
+    // ── Dynamic layout (recomputed on resize) ────────────────────────────────
+    int winW_       = 1638;
+    int winH_       = 1000;
+    int viewportW_  = 1120;
+    int viewportH_  = 900;
+    int panelX_     = 940;
+    int panelW_     = 380;
+
+    void computeLayout() {
+        auto size  = window_.getSize();
+        winW_      = static_cast<int>(size.x);
+        winH_      = static_cast<int>(size.y);
+        panelW_    = std::clamp(winW_ / 4, PANEL_W_MIN, 560);
+        panelX_    = winW_ - panelW_ - 18;
+        viewportW_ = std::max(360, panelX_ - MAP_OX - 18);
+        viewportH_ = std::max(360, winH_ - MAP_OY - 20);
+    }
+
+    void updateMapViewport() {
+        mapView_.setSize({static_cast<float>(viewportW_), static_cast<float>(viewportH_)});
+        mapView_.setViewport(sf::FloatRect(
+            {static_cast<float>(MAP_OX) / winW_, static_cast<float>(MAP_OY) / winH_},
+            {static_cast<float>(viewportW_) / winW_, static_cast<float>(viewportH_) / winH_}
+        ));
+        clampCamera();
+    }
+
     sf::RenderWindow  window_;
+    jke::SimulationConfig config_;
     jke::SimulationEngine engine_;
     sf::Font          font_;
 
@@ -221,19 +261,46 @@ private:
     sf::Vector2f      camCenter_;
     sf::Clock         camClock_;
     float             zoom_       = 1.0f;   // 1.0 = 129 tiles visible
+    bool              draggingMap_ = false;
+    bool              leftMouseDown_ = false;
+    bool              leftDragMap_ = false;
+    sf::Vector2i      leftPressPixel_ = {0, 0};
+    sf::Vector2i      dragLastPixel_ = {0, 0};
 
-    float viewHalf() const { return (VIEWPORT_PX / zoom_) * 0.5f; }
-    float viewSize() const { return  VIEWPORT_PX / zoom_; }
+    float viewWidth() const { return  viewportW_ / zoom_; }
+    float viewHeight() const { return viewportH_ / zoom_; }
+
+    bool isMapPixel(sf::Vector2i pixel) const {
+        return pixel.x >= MAP_OX && pixel.y >= MAP_OY &&
+               pixel.x < MAP_OX + viewportW_ &&
+               pixel.y < MAP_OY + viewportH_;
+    }
+
+    void selectTileAt(sf::Vector2i pixel) {
+        sf::Vector2f world = window_.mapPixelToCoords(pixel, mapView_);
+        int tx = static_cast<int>(world.x / TILE_PX);
+        int ty = static_cast<int>(world.y / TILE_PX);
+        if (tx >= 0 && ty >= 0 && tx < MAP_TILES && ty < MAP_TILES) {
+            jke::TileID tid = static_cast<jke::TileID>(ty * MAP_TILES + tx);
+            selectedTile_ = (selectedTile_ == tid) ? jke::NO_TILE : tid;
+        } else {
+            selectedTile_ = jke::NO_TILE;
+        }
+    }
 
     void clampCamera() {
-        float h    = viewHalf();
-        float mapF = static_cast<float>(MAP_FULL_PX);
-        if (h * 2.f >= mapF) {
-            // View is larger than the map — lock to center
-            camCenter_ = {mapF * 0.5f, mapF * 0.5f};
+        const float halfW = viewWidth() * 0.5f;
+        const float halfH = viewHeight() * 0.5f;
+        const float mapF = static_cast<float>(MAP_FULL_PX);
+        if (halfW * 2.f >= mapF) {
+            camCenter_.x = mapF * 0.5f;
         } else {
-            camCenter_.x = std::clamp(camCenter_.x, h, mapF - h);
-            camCenter_.y = std::clamp(camCenter_.y, h, mapF - h);
+            camCenter_.x = std::clamp(camCenter_.x, halfW, mapF - halfW);
+        }
+        if (halfH * 2.f >= mapF) {
+            camCenter_.y = mapF * 0.5f;
+        } else {
+            camCenter_.y = std::clamp(camCenter_.y, halfH, mapF - halfH);
         }
         mapView_.setCenter(camCenter_);
     }
@@ -241,7 +308,9 @@ private:
     void applyZoom(float delta, sf::Vector2i mousePixels) {
         constexpr float STEP   = 1.18f;
         // Minimum zoom: never show more than the full map
-        const float MIN_Z = static_cast<float>(VIEWPORT_PX) / static_cast<float>(MAP_FULL_PX);
+        const float MIN_Z = std::min(static_cast<float>(viewportW_),
+                                     static_cast<float>(viewportH_)) /
+                            static_cast<float>(MAP_FULL_PX);
         constexpr float MAX_Z  = 8.0f;
         // Use pow so trackpad micro-deltas give small steps, wheel clicks give full STEP
         float factor = std::pow(STEP, delta);
@@ -251,11 +320,76 @@ private:
         // World point under cursor — should stay fixed while zooming
         sf::Vector2f worldBefore = window_.mapPixelToCoords(mousePixels, mapView_);
         zoom_ = newZoom;
-        mapView_.setSize({viewSize(), viewSize()});
+        mapView_.setSize({viewWidth(), viewHeight()});
 
         // Re-derive world point and offset camera so it stays put
         sf::Vector2f worldAfter = window_.mapPixelToCoords(mousePixels, mapView_);
         camCenter_ += worldBefore - worldAfter;
+        clampCamera();
+    }
+
+    void resetCamera() {
+        zoom_ = 1.0f;
+        mapView_.setSize({viewWidth(), viewHeight()});
+        camCenter_ = {MAP_FULL_PX / 2.f, MAP_FULL_PX / 2.f};
+        clampCamera();
+    }
+
+    void showFullMap() {
+        const float minZoom = std::min(static_cast<float>(viewportW_),
+                                       static_cast<float>(viewportH_)) /
+                              static_cast<float>(MAP_FULL_PX);
+        zoom_ = minZoom;
+        mapView_.setSize({viewWidth(), viewHeight()});
+        camCenter_ = {MAP_FULL_PX / 2.f, MAP_FULL_PX / 2.f};
+        clampCamera();
+    }
+
+    void resetSimulation() {
+        paused_ = true;
+        engine_.reset();
+        selectedTile_ = jke::NO_TILE;
+        sortedKingdoms_.clear();
+        sortedKingdomsTurn_ = ~0u;
+        tileArmy_.clear();
+        districtOwner_.clear();
+        districtCity_.clear();
+        previousDistrictOwner_.clear();
+        districtFlashTurns_.clear();
+        haveDistrictHistory_ = false;
+        districtSignature_ = 0;
+        minimapTurn_ = ~0u;
+        lastMapImageTurn_ = ~0u;
+        terrainBuilt_ = false;
+        terrain_.clear();
+        pixels_.clear();
+        minimapPixels_.clear();
+        logScrollOffset_ = 0;
+        resetCamera();
+        rebuildMapImage();
+        camClock_.restart();
+    }
+
+    void adjustInitialKingdoms(int delta) {
+        const uint32_t next = std::clamp<int>(
+            static_cast<int>(config_.initialKingdoms) + delta, 4,
+            jke::constants::NUM_KINGDOMS);
+        if (next == config_.initialKingdoms) return;
+        config_.initialKingdoms = next;
+        engine_.setInitialKingdoms(config_.initialKingdoms);
+        resetSimulation();
+    }
+
+    void centerOnSelected() {
+        if (selectedTile_ == jke::NO_TILE ||
+            selectedTile_ >= static_cast<jke::TileID>(engine_.worldMap().tileCount())) {
+            return;
+        }
+        const auto& tile = engine_.worldMap().at(selectedTile_);
+        camCenter_ = {
+            static_cast<float>(tile.position.x * TILE_PX) + TILE_PX * 0.5f,
+            static_cast<float>(tile.position.y * TILE_PX) + TILE_PX * 0.5f
+        };
         clampCamera();
     }
 
@@ -266,10 +400,17 @@ private:
 
     bool  paused_ = false;
     int   speed_  = 2;   // turns per second
+    int   logScrollOffset_ = 0;   // chronicle scroll position (lines from top)
 
     // Mouse selection
     jke::TileID     selectedTile_     = jke::NO_TILE;
     sf::FloatRect   minimapScreenRect_;   // filled by drawPanel, used by mouse handler
+    sf::FloatRect   pauseButtonRect_;
+    sf::FloatRect   resetButtonRect_;
+    sf::FloatRect   fitButtonRect_;
+    sf::FloatRect   homeButtonRect_;
+    sf::FloatRect   kingdomMinusRect_;
+    sf::FloatRect   kingdomPlusRect_;
 
     // Cached kingdom sort order — rebuilt once per turn, not every frame
     std::vector<const jke::Kingdom*> sortedKingdoms_;
@@ -298,6 +439,14 @@ private:
         while (const auto event = window_.pollEvent()) {
             if (event->is<sf::Event::Closed>()) {
                 window_.close();
+            } else if (const auto* resized = event->getIf<sf::Event::Resized>()) {
+                (void)resized;
+                window_.setView(sf::View(sf::FloatRect(
+                    {0.f, 0.f},
+                    {static_cast<float>(window_.getSize().x),
+                     static_cast<float>(window_.getSize().y)})));
+                computeLayout();
+                updateMapViewport();
             } else if (const auto* key = event->getIf<sf::Event::KeyPressed>()) {
                 switch (key->code) {
                     case sf::Keyboard::Key::Escape:
@@ -308,13 +457,39 @@ private:
                         paused_ = !paused_;
                         break;
                     case sf::Keyboard::Key::Up:
-                        speed_ = std::min(240, speed_ + (speed_ >= 20 ? 10 : 1));
+                        if (engine_.isOver())
+                            logScrollOffset_ = std::max(0, logScrollOffset_ - 3);
+                        else
+                            speed_ = std::min(240, speed_ + (speed_ >= 20 ? 10 : 1));
                         break;
                     case sf::Keyboard::Key::Down:
-                        speed_ = std::max(1, speed_ - (speed_ > 20 ? 10 : 1));
+                        if (engine_.isOver())
+                            logScrollOffset_ += 3;
+                        else
+                            speed_ = std::max(1, speed_ - (speed_ > 20 ? 10 : 1));
                         break;
                     case sf::Keyboard::Key::Right:
                         if (paused_) { engine_.step(); rebuildMapImage(); }
+                        break;
+                    case sf::Keyboard::Key::R:
+                        resetSimulation();
+                        break;
+                    case sf::Keyboard::Key::LBracket:
+                    case sf::Keyboard::Key::Hyphen:
+                        adjustInitialKingdoms(-1);
+                        break;
+                    case sf::Keyboard::Key::RBracket:
+                    case sf::Keyboard::Key::Equal:
+                        adjustInitialKingdoms(1);
+                        break;
+                    case sf::Keyboard::Key::Home:
+                        resetCamera();
+                        break;
+                    case sf::Keyboard::Key::F:
+                        showFullMap();
+                        break;
+                    case sf::Keyboard::Key::C:
+                        centerOnSelected();
                         break;
                     // Number keys 1-9: jump camera to Nth alive kingdom's capital
                     case sf::Keyboard::Key::Num1: jumpToKingdom(0); break;
@@ -330,32 +505,77 @@ private:
                 }
             } else if (const auto* scroll = event->getIf<sf::Event::MouseWheelScrolled>()) {
                 if (scroll->wheel == sf::Mouse::Wheel::Vertical) {
-                    applyZoom(scroll->delta, scroll->position);
+                    if (engine_.isOver()) {
+                        logScrollOffset_ -= static_cast<int>(scroll->delta);
+                        logScrollOffset_ = std::max(0, logScrollOffset_);
+                    } else {
+                        applyZoom(scroll->delta, scroll->position);
+                    }
+                }
+            } else if (const auto* mm = event->getIf<sf::Event::MouseMoved>()) {
+                if (leftMouseDown_ && !leftDragMap_) {
+                    int dx = mm->position.x - leftPressPixel_.x;
+                    int dy = mm->position.y - leftPressPixel_.y;
+                    if (dx * dx + dy * dy >= 16) {
+                        leftDragMap_ = true;
+                    }
+                }
+                if (draggingMap_ || leftDragMap_) {
+                    sf::Vector2f before = window_.mapPixelToCoords(dragLastPixel_, mapView_);
+                    sf::Vector2f after = window_.mapPixelToCoords(mm->position, mapView_);
+                    camCenter_ += before - after;
+                    dragLastPixel_ = mm->position;
+                    clampCamera();
                 }
             } else if (const auto* mb = event->getIf<sf::Event::MouseButtonPressed>()) {
+                if (mb->button == sf::Mouse::Button::Right ||
+                    mb->button == sf::Mouse::Button::Middle) {
+                    draggingMap_ = true;
+                    dragLastPixel_ = mb->position;
+                }
                 if (mb->button == sf::Mouse::Button::Left) {
                     sf::Vector2f mpos{static_cast<float>(mb->position.x),
                                       static_cast<float>(mb->position.y)};
 
+                    if (pauseButtonRect_.contains(mpos)) {
+                        paused_ = !paused_;
+                    } else if (resetButtonRect_.contains(mpos)) {
+                        resetSimulation();
+                    } else if (fitButtonRect_.contains(mpos)) {
+                        showFullMap();
+                    } else if (homeButtonRect_.contains(mpos)) {
+                        resetCamera();
+                    } else if (kingdomMinusRect_.contains(mpos)) {
+                        adjustInitialKingdoms(-1);
+                    } else if (kingdomPlusRect_.contains(mpos)) {
+                        adjustInitialKingdoms(1);
+                    }
                     // Minimap click → jump camera
-                    if (minimapScreenRect_.contains(mpos)) {
+                    else if (minimapScreenRect_.contains(mpos)) {
                         float fx = (mpos.x - minimapScreenRect_.position.x) / minimapScreenRect_.size.x;
                         float fy = (mpos.y - minimapScreenRect_.position.y) / minimapScreenRect_.size.y;
                         camCenter_ = {fx * MAP_FULL_PX, fy * MAP_FULL_PX};
                         clampCamera();
                     }
-                    // Map click → select tile
-                    else {
-                        sf::Vector2f world = window_.mapPixelToCoords(mb->position, mapView_);
-                        int tx = static_cast<int>(world.x / TILE_PX);
-                        int ty = static_cast<int>(world.y / TILE_PX);
-                        if (tx >= 0 && ty >= 0 && tx < MAP_TILES && ty < MAP_TILES) {
-                            jke::TileID tid = static_cast<jke::TileID>(ty * MAP_TILES + tx);
-                            selectedTile_ = (selectedTile_ == tid) ? jke::NO_TILE : tid;
-                        } else {
-                            selectedTile_ = jke::NO_TILE;
-                        }
+                    // Map click selects on release; drag pans.
+                    else if (isMapPixel(mb->position)) {
+                        leftMouseDown_ = true;
+                        leftDragMap_ = false;
+                        leftPressPixel_ = mb->position;
+                        dragLastPixel_ = mb->position;
                     }
+                }
+            } else if (const auto* mr = event->getIf<sf::Event::MouseButtonReleased>()) {
+                if (mr->button == sf::Mouse::Button::Left) {
+                    if (leftMouseDown_ && !leftDragMap_ && isMapPixel(mr->position)) {
+                        selectTileAt(mr->position);
+                    }
+                    leftMouseDown_ = false;
+                    leftDragMap_ = false;
+                }
+                if (mr->button == sf::Mouse::Button::Right ||
+                    mr->button == sf::Mouse::Button::Middle) {
+                    draggingMap_ = false;
                 }
             }
         }
@@ -492,8 +712,10 @@ private:
         anchors.reserve(cities.size());
         for (const auto& [cid, city] : cities) {
             if (city.isRuined || city.tile == jke::NO_TILE) continue;
-            auto kit = kingdoms.find(city.owner);
-            if (kit == kingdoms.end() || !kit->second.isAlive) continue;
+            if (city.owner != jke::NO_KINGDOM) {
+                auto kit = kingdoms.find(city.owner);
+                if (kit == kingdoms.end() || !kit->second.isAlive) continue;
+            }
             anchors.push_back(&city);
         }
         if (anchors.empty()) return;
@@ -552,6 +774,16 @@ private:
     }
 
     static float districtControlRadiusTiles(const jke::City& city) {
+        if (city.owner == jke::NO_KINGDOM) {
+            switch (city.cityType) {
+                case jke::CityType::Fortress:     return 17.0f;
+                case jke::CityType::TradeHub:     return 16.0f;
+                case jke::CityType::Port:         return 15.0f;
+                case jke::CityType::Mining:       return 14.0f;
+                case jke::CityType::Agricultural: return 13.0f;
+                case jke::CityType::Generic:      return 12.0f;
+            }
+        }
         if (city.isCapital) return 20.0f;
         switch (city.cityType) {
             case jke::CityType::Fortress:     return 15.0f;
@@ -611,11 +843,11 @@ private:
                 bool isCapital = hasCity && cities.count(t.city) &&
                                  cities.at(t.city).isCapital;
                 jke::KingdomID visualOwner =
-                    idx < static_cast<int>(districtOwner_.size()) ? districtOwner_[idx] : t.owner;
+                    idx < static_cast<int>(districtOwner_.size()) ? districtOwner_[idx] : jke::NO_KINGDOM;
                 jke::CityID visualDistrict =
                     idx < static_cast<int>(districtCity_.size()) ? districtCity_[idx] : jke::NO_CITY;
                 const bool districtControlled = tileInsideDistrictControl(t, visualDistrict);
-                jke::KingdomID tintOwner = districtControlled ? visualOwner : t.owner;
+                jke::KingdomID tintOwner = districtControlled ? visualOwner : jke::NO_KINGDOM;
                 bool currentCapitalDistrict =
                     visualDistrict != jke::NO_CITY &&
                     cities.count(visualDistrict) &&
@@ -634,7 +866,7 @@ private:
                     const jke::CityID nd = districtCity_[nidx];
                     const jke::KingdomID no = tileInsideDistrictControl(nt, nd)
                         ? districtOwner_[nidx]
-                        : nt.owner;
+                        : jke::NO_KINGDOM;
                     return no != tintOwner;
                 }();
                 bool kingdomBorderTop = (tintOwner != jke::NO_KINGDOM && ty > 0) && [&] {
@@ -643,7 +875,7 @@ private:
                     const jke::CityID nd = districtCity_[nidx];
                     const jke::KingdomID no = tileInsideDistrictControl(nt, nd)
                         ? districtOwner_[nidx]
-                        : nt.owner;
+                        : jke::NO_KINGDOM;
                     return no != tintOwner;
                 }();
                 bool districtBorderLeft = false;
@@ -699,6 +931,21 @@ private:
                         sf::Color c{pixels_[pi], pixels_[pi+1], pixels_[pi+2], 255};
                         if (tintOwner != jke::NO_KINGDOM)
                             c = blend(c, kingdomColor(tintOwner), districtControlled ? 0.38f : 0.24f);
+                        const bool neutralDistrict =
+                            districtControlled &&
+                            visualDistrict != jke::NO_CITY &&
+                            cities.count(visualDistrict) &&
+                            cities.at(visualDistrict).owner == jke::NO_KINGDOM;
+                        if (neutralDistrict) {
+                            c = blend(c, sf::Color{168, 136, 86}, 0.58f);
+                        }
+
+                        // Neutral outpost tile — bright cream tint, clearly visible on any terrain
+                        if (hasCity && tintOwner == jke::NO_KINGDOM &&
+                            cities.count(t.city) &&
+                            cities.at(t.city).owner == jke::NO_KINGDOM) {
+                            c = blend(c, sf::Color{230, 204, 132}, 0.92f);
+                        }
 
                         if (idx < static_cast<int>(districtFlashTurns_.size()) &&
                             districtControlled &&
@@ -713,7 +960,8 @@ private:
                         } else if (capitalDistrictBorder) {
                             c = blend(sf::Color{20, 16, 8}, GOLD_COLOR, 0.62f);
                         } else if (districtBorder) {
-                            c = shade(c, -0.44f);
+                            if (neutralDistrict) c = sf::Color{78, 62, 40};
+                            else c = shade(c, -0.44f);
                         }
 
                         // Invasion red tint
@@ -796,9 +1044,14 @@ private:
                         const jke::KingdomID owner =
                             districtControlled && idx < static_cast<int>(districtOwner_.size())
                                 ? districtOwner_[idx]
-                                : t.owner;
+                                : jke::NO_KINGDOM;
                         if (owner != jke::NO_KINGDOM) {
                             c = blend(c, kingdomColor(owner), districtControlled ? 0.38f : 0.24f);
+                        } else if (districtControlled &&
+                                   district != jke::NO_CITY &&
+                                   cities.count(district) &&
+                                   cities.at(district).owner == jke::NO_KINGDOM) {
+                            c = blend(c, sf::Color{168, 136, 86}, 0.62f);
                         }
                     }
                     int mi = (ty * MAP_TILES + tx) * 4;
@@ -829,6 +1082,25 @@ private:
         txt.setFillColor(col);
         txt.setPosition({x, y});
         window_.draw(txt);
+    }
+
+    std::string fitText(std::string str, unsigned size, float maxWidth) const {
+        if (maxWidth <= 0.0f) return "";
+        sf::Text txt(font_, str, size);
+        if (txt.getLocalBounds().size.x <= maxWidth) return str;
+
+        const std::string suffix = "...";
+        while (str.size() > suffix.size()) {
+            str.pop_back();
+            txt.setString(str + suffix);
+            if (txt.getLocalBounds().size.x <= maxWidth) return str + suffix;
+        }
+        return suffix;
+    }
+
+    void drawTextFit(const std::string& str, float x, float y, float maxWidth,
+                     unsigned size = 13, sf::Color col = TEXT_COLOR) {
+        drawText(fitText(str, size, maxWidth), x, y, size, col);
     }
 
     void drawRect(float x, float y, float w, float h, sf::Color fill,
@@ -940,13 +1212,13 @@ private:
         const auto& hist = engine_.history();
         if (hist.empty()) return;
 
-        constexpr float GW = 340.f;
+        const float GW = static_cast<float>(panelW_ - 32);
         constexpr float GH = 72.f;
         float gx = px;
         float gy = py + 4.f;
 
         // Don't draw if it would collide with the terrain legend
-        if (gy + GH + 40.f > WIN_H - 132.f) return;
+        if (gy + GH + 40.f > winH_ - 132.f) return;
 
         drawSectionTitle("POPULATION TREND", gx, gy);
         gy += 24.f;
@@ -1005,7 +1277,7 @@ private:
 
         // Position: bottom-left of map viewport
         float bx = MAP_OX + 6.f;
-        float by = MAP_OY + VIEWPORT_PX - 156.f;
+        float by = MAP_OY + viewportH_ - 156.f;
         float bw = 230.f;
         float bh = 148.f;
 
@@ -1097,14 +1369,89 @@ private:
         if (tile.army != jke::NO_ARMY && armies.count(tile.army)) {
             const auto& army = armies.at(tile.army);
             sf::Color ac = kingdomColor(army.owner);
+
+            auto roleColor = [](jke::ArmyRole r) -> sf::Color {
+                switch (r) {
+                    case jke::ArmyRole::Vanguard:    return sf::Color{255, 140,  60};
+                    case jke::ArmyRole::Flanker:     return sf::Color{255, 210,  80};
+                    case jke::ArmyRole::Siege:       return sf::Color{220,  80,  80};
+                    case jke::ArmyRole::Attack:      return sf::Color{220, 110,  90};
+                    case jke::ArmyRole::Garrison:    return sf::Color{ 80, 180, 255};
+                    case jke::ArmyRole::SupplyGuard: return sf::Color{100, 220, 120};
+                    case jke::ArmyRole::Defense:     return sf::Color{120, 160, 220};
+                    default:                         return sf::Color{140, 148, 162};
+                }
+            };
+
             std::ostringstream as;
             as << "Army: " << army.totalSoldiers() << " soldiers";
             drawText(as.str(), bx + 6.f, y, 11, ac);
             y += 15.f;
-            std::ostringstream as2;
-            as2 << "Supply " << static_cast<int>(army.supplyLevel * 100) << "%"
-                << "  Role: " << jke::armyRoleName(army.role);
-            drawText(as2.str(), bx + 6.f, y, 10, DIM_COLOR);
+
+            // Role (colored) + supply %
+            sf::Color rc = roleColor(army.role);
+            std::string roleLine = std::string(jke::armyRoleName(army.role));
+            roleLine += "   Supply " + std::to_string(static_cast<int>(army.supplyLevel * 100)) + "%";
+            drawText(roleLine, bx + 6.f, y, 10, rc);
+            y += 13.f;
+
+            // Supply bar
+            {
+                float barW = static_cast<float>(panelW_ - 18);
+                float filled = barW * std::clamp(army.supplyLevel, 0.0f, 1.0f);
+                sf::Color barCol = army.supplyLevel >= 0.7f ? sf::Color{80, 200, 100}
+                                 : army.supplyLevel >= 0.4f ? sf::Color{220, 180, 60}
+                                                            : sf::Color{220, 70, 70};
+                sf::RectangleShape bg({barW, 4.f});
+                bg.setPosition({bx + 6.f, y});
+                bg.setFillColor(sf::Color{40, 46, 60});
+                window_.draw(bg);
+                if (filled > 0.f) {
+                    sf::RectangleShape bar({filled, 4.f});
+                    bar.setPosition({bx + 6.f, y});
+                    bar.setFillColor(barCol);
+                    window_.draw(bar);
+                }
+                y += 8.f;
+            }
+
+            // Target city or tile
+            if (army.targetTile != jke::NO_TILE &&
+                army.targetTile < static_cast<jke::TileID>(engine_.worldMap().tileCount())) {
+                const auto& tgt = engine_.worldMap().at(army.targetTile);
+                std::string targetStr = "Target: ";
+                if (tgt.city != jke::NO_CITY && engine_.cities().count(tgt.city)) {
+                    targetStr += engine_.cities().at(tgt.city).name;
+                } else {
+                    targetStr += "(" + std::to_string(tgt.position.x) +
+                                 "," + std::to_string(tgt.position.y) + ")";
+                }
+                if (army.currentTile != jke::NO_TILE &&
+                    army.currentTile < static_cast<jke::TileID>(engine_.worldMap().tileCount())) {
+                    const auto& ap = engine_.worldMap().at(army.currentTile).position;
+                    int dist = static_cast<int>(
+                        std::hypot(float(tgt.position.x - ap.x),
+                                   float(tgt.position.y - ap.y)));
+                    targetStr += " (" + std::to_string(dist) + "t)";
+                }
+                drawText(targetStr, bx + 6.f, y, 10, DIM_COLOR);
+                y += 13.f;
+            }
+
+            if (army.hasCommander()) {
+                std::string state = army.commander.wounded ? " (wounded)" : "";
+                drawText("General: " + ellipsize(army.commander.name, 24) + state,
+                         bx + 6.f, y, 10, army.commander.fame >= 0.45f ? GOLD_COLOR : DIM_COLOR);
+                y += 13.f;
+            } else {
+                drawText("General: none", bx + 6.f, y, 10, MUTED_COLOR);
+                y += 13.f;
+            }
+            if (army.hasStrategist()) {
+                std::string state = army.strategist.wounded ? " (wounded)" : "";
+                drawText("Strategist: " + ellipsize(army.strategist.name, 22) + state,
+                         bx + 6.f, y, 10, army.strategist.fame >= 0.45f ? GOLD_COLOR : DIM_COLOR);
+            }
         }
     }
 
@@ -1196,24 +1543,29 @@ private:
     void drawCityOverlays() {
         const auto& kingdoms = engine_.kingdoms();
         for (const auto& [cid, city] : engine_.cities()) {
-            auto kit = kingdoms.find(city.owner);
-            if (kit == kingdoms.end() || !kit->second.isAlive || city.tile == jke::NO_TILE) continue;
+            if (city.tile == jke::NO_TILE) continue;
+            const bool neutral = city.owner == jke::NO_KINGDOM;
+            if (!neutral) {
+                auto kit = kingdoms.find(city.owner);
+                if (kit == kingdoms.end() || !kit->second.isAlive) continue;
+            }
 
             sf::Vector2f pos = tileCenter(city.tile);
-            sf::Color owner = kingdomColor(city.owner);
+            sf::Color owner = neutral ? sf::Color{210, 198, 142} : kingdomColor(city.owner);
 
-            if (city.isCapital || city.cityType != jke::CityType::Generic) {
-                float influenceRadius = 32.f;
+            if (neutral || city.isCapital || city.cityType != jke::CityType::Generic) {
+                float influenceRadius = neutral ? 28.f : 32.f;
                 if (city.isCapital) influenceRadius = 74.f;
                 else if (city.cityType == jke::CityType::Fortress) influenceRadius = 52.f;
                 else if (city.cityType == jke::CityType::TradeHub) influenceRadius = 46.f;
                 else if (city.cityType == jke::CityType::Port) influenceRadius = 42.f;
                 else if (city.cityType == jke::CityType::Mining) influenceRadius = 38.f;
+                if (neutral && city.cityType == jke::CityType::Generic) influenceRadius = 24.f;
 
                 sf::Color ringColor = city.isCapital
                     ? GOLD_COLOR
                     : blend(owner, sf::Color::White, 0.36f);
-                ringColor.a = city.isCapital ? 86 : 54;
+                ringColor.a = city.isCapital ? 86 : (neutral ? 44 : 54);
 
                 sf::CircleShape influence(influenceRadius);
                 influence.setOrigin({influenceRadius, influenceRadius});
@@ -1234,7 +1586,7 @@ private:
                 }
             }
 
-            float radius = city.isCapital ? 10.f : 6.f;
+            float radius = city.isCapital ? 10.f : (neutral ? 4.8f : 6.f);
             sf::CircleShape shadow(radius + 2.f);
             shadow.setOrigin({radius + 2.f, radius + 2.f});
             shadow.setPosition(pos);
@@ -1246,14 +1598,15 @@ private:
             ring.setPosition(pos);
             ring.setFillColor(sf::Color{12, 14, 18, 170});
             ring.setOutlineColor(city.isCapital ? GOLD_COLOR : blend(owner, sf::Color::White, 0.32f));
-            ring.setOutlineThickness(city.isCapital ? 2.4f : 1.6f);
+            ring.setOutlineThickness(city.isCapital ? 2.4f : (neutral ? 1.2f : 1.6f));
             window_.draw(ring);
 
-            sf::CircleShape core(city.isCapital ? 3.6f : 2.6f);
-            float coreRadius = city.isCapital ? 3.6f : 2.6f;
+            const float coreRadius = city.isCapital ? 3.6f : (neutral ? 2.0f : 2.6f);
+            sf::CircleShape core(coreRadius);
             core.setOrigin({coreRadius, coreRadius});
             core.setPosition(pos);
-            core.setFillColor(city.isCapital ? GOLD_COLOR : sf::Color{238, 242, 247});
+            core.setFillColor(city.isCapital ? GOLD_COLOR :
+                              neutral ? sf::Color{230, 218, 165} : sf::Color{238, 242, 247});
             window_.draw(core);
 
             // City type badge (small letter beside non-capital cities)
@@ -1291,6 +1644,8 @@ private:
         const float outline = (army.role == jke::ArmyRole::Siege) ? 2.4f : 2.0f;
 
         switch (army.role) {
+            case jke::ArmyRole::Vanguard:
+            case jke::ArmyRole::Flanker:
             case jke::ArmyRole::Attack: {
                 sf::ConvexShape blade(4);
                 blade.setPoint(0, {pos.x, pos.y - radius * 1.45f});
@@ -1317,6 +1672,8 @@ private:
                 window_.draw(grip);
                 break;
             }
+            case jke::ArmyRole::Garrison:
+            case jke::ArmyRole::SupplyGuard:
             case jke::ArmyRole::Defense: {
                 sf::ConvexShape shield(6);
                 shield.setPoint(0, {pos.x - radius * 0.85f, pos.y - radius * 0.9f});
@@ -1406,9 +1763,12 @@ private:
         if (soldiers >= 3000) detachments = 5;
 
         float spread = radius * 1.85f;
-        if (army.role == jke::ArmyRole::Defense) spread = radius * 1.55f;
+        if (army.role == jke::ArmyRole::Defense ||
+            army.role == jke::ArmyRole::Garrison ||
+            army.role == jke::ArmyRole::SupplyGuard) spread = radius * 1.55f;
         if (army.role == jke::ArmyRole::Siege) spread = radius * 1.35f;
         if (army.role == jke::ArmyRole::Reserve) spread = radius * 1.25f;
+        if (army.role == jke::ArmyRole::Flanker) spread = radius * 2.15f;
 
         sf::Color zoneColor = bodyColor;
         zoneColor.a = invasion ? 58 : 38;
@@ -1422,8 +1782,12 @@ private:
         window_.draw(zone);
 
         const float startAngle =
-            army.role == jke::ArmyRole::Attack ? -1.5708f :
-            army.role == jke::ArmyRole::Defense ? 3.14159f :
+            (army.role == jke::ArmyRole::Attack ||
+             army.role == jke::ArmyRole::Vanguard) ? -1.5708f :
+            army.role == jke::ArmyRole::Flanker ? -0.35f :
+            (army.role == jke::ArmyRole::Defense ||
+             army.role == jke::ArmyRole::Garrison ||
+             army.role == jke::ArmyRole::SupplyGuard) ? 3.14159f :
             army.role == jke::ArmyRole::Siege ? -0.7854f : 2.3562f;
 
         for (int i = 0; i < detachments; ++i) {
@@ -1440,7 +1804,9 @@ private:
             sf::Color pipOutline = outlineColor;
             pipOutline.a = 230;
 
-            if (army.role == jke::ArmyRole::Attack) {
+            if (army.role == jke::ArmyRole::Attack ||
+                army.role == jke::ArmyRole::Vanguard ||
+                army.role == jke::ArmyRole::Flanker) {
                 sf::ConvexShape wedge(3);
                 const float r = std::max(2.6f, radius * 0.36f);
                 wedge.setPoint(0, {p.x, p.y - r});
@@ -1450,7 +1816,9 @@ private:
                 wedge.setOutlineColor(pipOutline);
                 wedge.setOutlineThickness(0.8f);
                 window_.draw(wedge);
-            } else if (army.role == jke::ArmyRole::Defense) {
+            } else if (army.role == jke::ArmyRole::Defense ||
+                       army.role == jke::ArmyRole::Garrison ||
+                       army.role == jke::ArmyRole::SupplyGuard) {
                 sf::RectangleShape block({radius * 0.58f, radius * 0.58f});
                 block.setOrigin({radius * 0.29f, radius * 0.29f});
                 block.setPosition(p);
@@ -1524,11 +1892,25 @@ private:
             }
 
             sf::Color roleOutline = sf::Color{10, 12, 16};
-            if (army.role == jke::ArmyRole::Defense) roleOutline = sf::Color{80, 170, 235};
+            if (army.role == jke::ArmyRole::Defense ||
+                army.role == jke::ArmyRole::Garrison ||
+                army.role == jke::ArmyRole::SupplyGuard) roleOutline = sf::Color{80, 170, 235};
             if (army.role == jke::ArmyRole::Siege) roleOutline = GOLD_COLOR;
+            if (army.role == jke::ArmyRole::Vanguard) roleOutline = sf::Color{255, 90, 70};
+            if (army.role == jke::ArmyRole::Flanker) roleOutline = sf::Color{196, 110, 255};
             if (invasion) roleOutline = sf::Color{238, 72, 72};
+            if (army.hasNotableLeader()) roleOutline = sf::Color{245, 220, 90};
             drawArmyFormation(army, pos, radius, baseBodyColor, roleOutline, invasion);
             drawArmyRoleMarker(army, pos, radius, baseBodyColor, roleOutline);
+            if (army.hasNotableLeader()) {
+                sf::CircleShape halo(radius + 5.f);
+                halo.setOrigin({radius + 5.f, radius + 5.f});
+                halo.setPosition(pos);
+                halo.setFillColor(sf::Color::Transparent);
+                halo.setOutlineColor(sf::Color{245, 220, 90, 150});
+                halo.setOutlineThickness(1.8f);
+                window_.draw(halo);
+            }
 
             // Supply bar below the army marker
             {
@@ -1560,7 +1942,7 @@ private:
 
     void drawSectionTitle(const std::string& title, float x, float y) {
         drawText(title, x, y, 12, GOLD_COLOR);
-        drawRect(x, y + 18.f, PANEL_W - 32.f, 1.f, BORDER_COLOR);
+        drawRect(x, y + 18.f, panelW_ - 32.f, 1.f, BORDER_COLOR);
     }
 
     void drawMetric(float x, float y, float w, const std::string& label,
@@ -1571,11 +1953,21 @@ private:
         drawText(value, x + 12.f, y + 25.f, 19, TEXT_COLOR);
     }
 
+    void drawButton(const sf::FloatRect& rect, const std::string& label, sf::Color accent) {
+        drawRect(rect.position.x, rect.position.y, rect.size.x, rect.size.y,
+                 sf::Color{30, 36, 48}, BORDER_COLOR, 1.f);
+        drawRect(rect.position.x, rect.position.y, 3.f, rect.size.y, accent);
+        drawText(label, rect.position.x + 10.f, rect.position.y + 6.f, 11, TEXT_COLOR);
+    }
+
     std::string situationText(const jke::Kingdom& k) const {
         int attack = 0;
         int defense = 0;
         int siege = 0;
         int reserve = 0;
+        int vanguard = 0;
+        int flanker = 0;
+        int guard = 0;
         jke::CityID targetCity = jke::NO_CITY;
 
         for (jke::ArmyID aid : k.armies) {
@@ -1586,6 +1978,10 @@ private:
             if (army.role == jke::ArmyRole::Defense) ++defense;
             if (army.role == jke::ArmyRole::Siege) ++siege;
             if (army.role == jke::ArmyRole::Reserve) ++reserve;
+            if (army.role == jke::ArmyRole::Vanguard) ++vanguard;
+            if (army.role == jke::ArmyRole::Flanker) ++flanker;
+            if (army.role == jke::ArmyRole::Garrison ||
+                army.role == jke::ArmyRole::SupplyGuard) ++guard;
 
             if (army.targetTile != jke::NO_TILE &&
                 army.targetTile < static_cast<jke::TileID>(engine_.worldMap().tileCount())) {
@@ -1645,8 +2041,10 @@ private:
         }
 
         std::ostringstream roles;
-        roles << "  A" << attack << " D" << defense << " S" << siege << " R" << reserve;
-        return ellipsize(status, 48) + roles.str();
+        roles << "  V" << vanguard << " F" << flanker
+              << " A" << attack << " D" << defense + guard
+              << " S" << siege << " R" << reserve;
+        return ellipsize(status, 54) + roles.str();
     }
 
     // ── Render ────────────────────────────────────────────────────────────────
@@ -1654,16 +2052,31 @@ private:
         window_.clear(BG_COLOR);
 
         // ── Default view: UI chrome ──────────────────────────────────────────
-        drawRect(0.f, 0.f, static_cast<float>(WIN_W), 44.f, TOP_COLOR);
+        drawRect(0.f, 0.f, static_cast<float>(winW_), 44.f, TOP_COLOR);
         drawText("JojiKingdomEngine", 18.f, 12.f, 18, GOLD_COLOR);
         drawText("continental simulation", 190.f, 15.f, 12, DIM_COLOR);
+        pauseButtonRect_ = sf::FloatRect({static_cast<float>(panelX_), 9.f}, {62.f, 26.f});
+        resetButtonRect_ = sf::FloatRect({static_cast<float>(panelX_ + 70), 9.f}, {62.f, 26.f});
+        fitButtonRect_   = sf::FloatRect({static_cast<float>(panelX_ + 140), 9.f}, {50.f, 26.f});
+        homeButtonRect_  = sf::FloatRect({static_cast<float>(panelX_ + 198), 9.f}, {58.f, 26.f});
+        kingdomMinusRect_ = sf::FloatRect({static_cast<float>(panelX_ + 266), 9.f}, {28.f, 26.f});
+        kingdomPlusRect_  = sf::FloatRect({static_cast<float>(panelX_ + 302), 9.f}, {28.f, 26.f});
+        drawButton(pauseButtonRect_, paused_ ? "Run" : "Pause",
+                   paused_ ? sf::Color{86, 172, 126} : GOLD_COLOR);
+        drawButton(resetButtonRect_, "Reset", sf::Color{220, 90, 90});
+        drawButton(fitButtonRect_, "Fit", sf::Color{82, 142, 214});
+        drawButton(homeButtonRect_, "Home", sf::Color{160, 150, 220});
+        drawButton(kingdomMinusRect_, "-", sf::Color{120, 130, 150});
+        drawButton(kingdomPlusRect_, "+", sf::Color{86, 172, 126});
+        drawText("K " + std::to_string(config_.initialKingdoms),
+                 static_cast<float>(panelX_ + 338), 15.f, 11, TEXT_COLOR);
 
         // Map area background and frame (screen coords)
         drawRect(static_cast<float>(MAP_OX - 5), static_cast<float>(MAP_OY - 5),
-                 static_cast<float>(VIEWPORT_PX + 10), static_cast<float>(VIEWPORT_PX + 10),
+                 static_cast<float>(viewportW_ + 10), static_cast<float>(viewportH_ + 10),
                  sf::Color{8, 10, 14});
         drawRect(static_cast<float>(MAP_OX - 2), static_cast<float>(MAP_OY - 2),
-                 static_cast<float>(VIEWPORT_PX + 4), static_cast<float>(VIEWPORT_PX + 4),
+                 static_cast<float>(viewportW_ + 4), static_cast<float>(viewportH_ + 4),
                  SURFACE_COLOR, BORDER_COLOR, 1.f);
 
         // ── Map view: scrollable world ───────────────────────────────────────
@@ -1680,24 +2093,24 @@ private:
             drawTileInspector();
         }
 
-        sf::RectangleShape border({VIEWPORT_PX + 2.f, VIEWPORT_PX + 2.f});
+        sf::RectangleShape border({static_cast<float>(viewportW_ + 2), static_cast<float>(viewportH_ + 2)});
         border.setPosition({static_cast<float>(MAP_OX) - 1.f, static_cast<float>(MAP_OY) - 1.f});
         border.setFillColor(sf::Color::Transparent);
         border.setOutlineColor(sf::Color{96, 110, 132});
         border.setOutlineThickness(1.f);
         window_.draw(border);
 
-        drawRect(static_cast<float>(PANEL_X), 62.f, static_cast<float>(PANEL_W),
-                 static_cast<float>(WIN_H - 82), PANEL_COLOR, BORDER_COLOR, 1.f);
+        drawRect(static_cast<float>(panelX_), 62.f, static_cast<float>(panelW_),
+                 static_cast<float>(winH_ - 82), PANEL_COLOR, BORDER_COLOR, 1.f);
 
         drawPanel();
         window_.display();
     }
 
     void drawPanel() {
-        const float px = PANEL_X + 16.f;
+        const float px = panelX_ + 16.f;
         float py = 78.f;
-        const float contentW = PANEL_W - 32.f;
+        const float contentW = panelW_ - 32.f;
 
         auto turn = engine_.currentTurn();
 
@@ -1714,42 +2127,158 @@ private:
             }
         }
 
-        // ── Victory screen ───────────────────────────────────────────────────
+        // ── Victory / Chronicle screen ───────────────────────────────────────
         if (engine_.isOver() && alive == 1 && lastAlive != jke::NO_KINGDOM) {
             const auto& winner = engine_.kingdoms().at(lastAlive);
-            int colorIdx = static_cast<int>(lastAlive) % 16;
-            sf::Color wCol = KINGDOM_COL[colorIdx];
+            sf::Color wCol = KINGDOM_COL[static_cast<int>(lastAlive) % 16];
 
-            drawRect(px - 16.f, py - 16.f, static_cast<float>(PANEL_W),
-                     static_cast<float>(WIN_H - 60), sf::Color{8, 10, 14, 230});
+            // Full-panel dark backdrop
+            drawRect(px - 16.f, py - 16.f,
+                     static_cast<float>(panelW_),
+                     static_cast<float>(winH_ - 60),
+                     sf::Color{8, 10, 14, 230});
 
-            float cy = py + 60.f;
-            drawText("CONTINENT UNIFIED", px + 20.f, cy, 22, GOLD_COLOR);
-            cy += 42.f;
-            drawRect(px, cy, contentW, 3.f, GOLD_COLOR);
-            cy += 18.f;
-            drawText(winner.name, px + 10.f, cy, 26, wCol);
-            cy += 44.f;
-            drawText("Turn " + std::to_string(turn), px + 10.f, cy, 14, DIM_COLOR);
-            cy += 22.f;
-            drawText("Population: " + compactNumber(winner.totalPopulation),
-                     px + 10.f, cy, 13, TEXT_COLOR);
-            cy += 20.f;
-            drawText("Cities: " + std::to_string(winner.cities.size()),
-                     px + 10.f, cy, 13, TEXT_COLOR);
-            cy += 20.f;
-            drawText("Armies: " + std::to_string(winner.armies.size()),
-                     px + 10.f, cy, 13, TEXT_COLOR);
+            float cy = py + 14.f;
+
+            // ── Winner header ─────────────────────────────────────────────────
+            drawText("CONTINENT UNIFIED", px + 10.f, cy, 18, GOLD_COLOR);
             cy += 30.f;
-            drawText("Press Q to quit", px + 10.f, cy, 11, MUTED_COLOR);
+            drawRect(px, cy, contentW, 2.f, GOLD_COLOR);
+            cy += 8.f;
+            drawTextFit(winner.name, px + 8.f, cy, contentW - 16.f, 22, wCol);
+            cy += 34.f;
+
+            // Stat row
+            std::string statLine =
+                "Turn " + std::to_string(turn) +
+                "  \xb7  Pop " + compactNumber(winner.totalPopulation) +
+                "  \xb7  Cities " + std::to_string(winner.cities.size()) +
+                "  \xb7  Armies " + std::to_string(winner.armies.size());
+            drawTextFit(statLine, px + 8.f, cy, contentW - 16.f, 10, DIM_COLOR);
+            cy += 20.f;
+
+            drawRect(px, cy, contentW, 1.f, BORDER_COLOR);
+            cy += 10.f;
+
+            // ── Chronicle header ──────────────────────────────────────────────
+            drawText("CHRONICLE", px + 8.f, cy, 11,
+                     sf::Color{160, 160, 180});
+            drawText("\xe2\x86\x91\xe2\x86\x93 scroll  R reset  Q quit",
+                     px + contentW - 130.f, cy + 2.f, 9, MUTED_COLOR);
+            cy += 22.f;
+
+            // ── Filter significant events ─────────────────────────────────────
+            const auto& all = engine_.timeline().all();
+            std::vector<const jke::HistoryEvent*> log;
+            log.reserve(all.size());
+            for (const auto& ev : all) {
+                switch (ev.type) {
+                    case jke::EventType::WarDeclared:
+                    case jke::EventType::PeaceSigned:
+                    case jke::EventType::AllianceFormed:
+                    case jke::EventType::AllianceBroken:
+                    case jke::EventType::BattleFought:
+                    case jke::EventType::CityConquered:
+                    case jke::EventType::CapitalCaptured:
+                    case jke::EventType::RebellionStarted:
+                    case jke::EventType::RebellionSuppressed:
+                    case jke::EventType::CivilWar:
+                    case jke::EventType::KingdomCollapsed:
+                    case jke::EventType::KingdomAnnexed:
+                    case jke::EventType::ContinentUnified:
+                    case jke::EventType::TechResearched:
+                    case jke::EventType::VassalFormed:
+                    case jke::EventType::VassalLiberated:
+                    case jke::EventType::WorldEventPositive:
+                    case jke::EventType::WorldEventNegative:
+                    case jke::EventType::PlagueSpread:
+                    case jke::EventType::TributaryEstablished:
+                        log.push_back(&ev);
+                        break;
+                    default:
+                        break;
+                }
+            }
+
+            // ── Scrollable list ───────────────────────────────────────────────
+            const float logTop    = cy;
+            const float logBottom = static_cast<float>(winH_) - 72.f;
+            const float lineH     = 27.f;
+            const int   visLines  = std::max(1, static_cast<int>((logBottom - logTop) / lineH));
+            const int   maxScroll = std::max(0, static_cast<int>(log.size()) - visLines);
+            logScrollOffset_ = std::clamp(logScrollOffset_, 0, maxScroll);
+
+            for (int i = logScrollOffset_;
+                 i < static_cast<int>(log.size()) && cy + lineH <= logBottom;
+                 ++i)
+            {
+                const auto& ev = *log[i];
+
+                // Row background (alternating)
+                sf::Color rowBg = (i % 2 == 0) ? sf::Color{18, 22, 32} : sf::Color{22, 27, 38};
+                drawRect(px, cy, contentW, lineH - 2.f, rowBg);
+
+                // Turn tag
+                std::string turnTag = "T" + std::to_string(ev.turn);
+                drawText(turnTag, px + 4.f, cy + 7.f, 8, sf::Color{90, 100, 120});
+
+                // Event color by type
+                sf::Color ec = TEXT_COLOR;
+                if      (ev.type == jke::EventType::KingdomCollapsed)  ec = {220, 80,  80};
+                else if (ev.type == jke::EventType::CapitalCaptured)   ec = {220, 110, 60};
+                else if (ev.type == jke::EventType::WarDeclared)       ec = {220, 160, 60};
+                else if (ev.type == jke::EventType::BattleFought)      ec = {200, 180, 100};
+                else if (ev.type == jke::EventType::AllianceFormed)    ec = {80,  180, 220};
+                else if (ev.type == jke::EventType::AllianceBroken)    ec = {120, 140, 180};
+                else if (ev.type == jke::EventType::ContinentUnified)  ec = GOLD_COLOR;
+                else if (ev.type == jke::EventType::CivilWar)          ec = {200, 80,  200};
+                else if (ev.type == jke::EventType::RebellionStarted)  ec = {180, 100, 200};
+                else if (ev.type == jke::EventType::PlagueSpread)      ec = {100, 200, 140};
+                else if (ev.type == jke::EventType::WorldEventPositive)ec = {100, 210, 120};
+                else if (ev.type == jke::EventType::WorldEventNegative)ec = {210, 100, 100};
+                else if (ev.type == jke::EventType::KingdomAnnexed)    ec = {180, 100,  60};
+                else if (ev.type == jke::EventType::TechResearched)    ec = {100, 160, 220};
+                else if (ev.type == jke::EventType::VassalFormed)      ec = {140, 180, 140};
+                else if (ev.type == jke::EventType::PeaceSigned)       ec = {120, 200, 160};
+
+                drawTextFit(ev.description,
+                            px + 38.f, cy + 6.f,
+                            contentW - 46.f, 10, ec);
+                cy += lineH;
+            }
+
+            // Scroll progress indicator
+            if (maxScroll > 0) {
+                float barH   = logBottom - logTop;
+                float thumbH = std::max(16.f, barH * visLines / static_cast<float>(log.size()));
+                float thumbY = logTop + (barH - thumbH) *
+                               static_cast<float>(logScrollOffset_) / static_cast<float>(maxScroll);
+                drawRect(px + contentW + 4.f, logTop, 4.f, barH, sf::Color{30, 36, 50});
+                drawRect(px + contentW + 4.f, thumbY, 4.f, thumbH, sf::Color{100, 110, 140});
+            }
+
+            // Bottom hint bar
+            drawRect(px - 16.f,
+                     static_cast<float>(winH_) - 66.f,
+                     static_cast<float>(panelW_), 52.f,
+                     sf::Color{10, 12, 18, 220});
+            std::string countLabel = std::to_string(logScrollOffset_ + 1) + "-" +
+                std::to_string(std::min(logScrollOffset_ + visLines,
+                                        static_cast<int>(log.size()))) +
+                " / " + std::to_string(log.size()) + " events";
+            drawText(countLabel, px + 8.f, static_cast<float>(winH_) - 56.f, 9, MUTED_COLOR);
+            drawText("R reset  |  Q quit",
+                     px + 8.f, static_cast<float>(winH_) - 42.f, 10, DIM_COLOR);
             return;
         }
 
-        drawMetric(px, py, 108.f, "TURN", std::to_string(turn),
+        const float metricGap = 14.f;
+        const float metricW = (contentW - metricGap * 2.f) / 3.f;
+        drawMetric(px, py, metricW, "TURN", std::to_string(turn),
                    paused_ ? GOLD_COLOR : sf::Color{86, 172, 126});
-        drawMetric(px + 123.f, py, 108.f, "KINGDOMS", std::to_string(alive),
+        drawMetric(px + metricW + metricGap, py, metricW, "KINGDOMS", std::to_string(alive),
                    sf::Color{82, 142, 214});
-        drawMetric(px + 246.f, py, 108.f, "POP", compactNumber(totalPop),
+        drawMetric(px + (metricW + metricGap) * 2.f, py, metricW, "POP", compactNumber(totalPop),
                    sf::Color{198, 120, 82});
         py += 68.f;
 
@@ -1758,7 +2287,8 @@ private:
                  paused_ ? GOLD_COLOR : sf::Color{118, 206, 148});
         drawText("Speed " + std::to_string(speed_) + " t/s", px + 104.f, py + 9.f, 12, DIM_COLOR);
         drawText("Armies " + std::to_string(totalArmies), px + 196.f, py + 9.f, 12, DIM_COLOR);
-        drawText("Space/Arrows/WASD/Q", px + 266.f, py + 10.f, 9, MUTED_COLOR);
+        drawTextFit("Start " + std::to_string(config_.initialKingdoms) + "  [-/+]",
+                    px + 284.f, py + 10.f, contentW - 292.f, 9, MUTED_COLOR);
         py += 28.f;
 
         // Season indicator
@@ -1777,10 +2307,10 @@ private:
             int year = engine_.currentTurn() / 80 + 1;
             std::string hordeStr = engine_.nomadHorde().active
                 ? "  |  HORDE!" : "";
-            drawText("Year " + std::to_string(year) + "  |  Bandits: " +
-                     std::to_string(engine_.bandits().size()) + hordeStr,
-                     px + 90.f, py + 5.f, 10,
-                     engine_.nomadHorde().active ? sf::Color{255,80,60} : DIM_COLOR);
+            drawTextFit("Year " + std::to_string(year) + "  |  Bandits: " +
+                        std::to_string(engine_.bandits().size()) + hordeStr,
+                        px + 90.f, py + 5.f, contentW - 96.f, 10,
+                        engine_.nomadHorde().active ? sf::Color{255,80,60} : DIM_COLOR);
             py += 22.f;
         }
         py += 4.f;
@@ -1794,11 +2324,12 @@ private:
             window_.draw(minimapSprite_);
 
             // Viewport indicator rectangle (size scales with zoom)
-            float visWorld = viewSize();  // world units currently visible
-            float vpW = visWorld / MAP_FULL_PX * MINIMAP_PX;
-            float vpH = vpW;
-            float vpL = (camCenter_.x - visWorld * 0.5f) / MAP_FULL_PX * MINIMAP_PX + px;
-            float vpT = (camCenter_.y - visWorld * 0.5f) / MAP_FULL_PX * MINIMAP_PX + py;
+            float visWorldW = viewWidth();
+            float visWorldH = viewHeight();
+            float vpW = visWorldW / MAP_FULL_PX * MINIMAP_PX;
+            float vpH = visWorldH / MAP_FULL_PX * MINIMAP_PX;
+            float vpL = (camCenter_.x - visWorldW * 0.5f) / MAP_FULL_PX * MINIMAP_PX + px;
+            float vpT = (camCenter_.y - visWorldH * 0.5f) / MAP_FULL_PX * MINIMAP_PX + py;
             sf::RectangleShape vpRect({vpW, vpH});
             vpRect.setPosition({vpL, vpT});
             vpRect.setFillColor(sf::Color::Transparent);
@@ -1807,8 +2338,8 @@ private:
             window_.draw(vpRect);
 
             py += MINIMAP_PX + 4.f;
-            drawText("WASD pan  |  scroll = zoom  |  " + std::to_string(MAP_TILES) + "x" +
-                     std::to_string(MAP_TILES) + " map", px, py, 9, MUTED_COLOR);
+            drawTextFit("WASD/drag pan  |  scroll zoom  |  C selected  |  1-9 capitals",
+                        px, py, contentW, 9, MUTED_COLOR);
             py += 18.f;
         }
 
@@ -1825,25 +2356,25 @@ private:
                     if (rel.state != jke::RelationState::War) continue;
                     if (!kingdoms.count(lo) || !kingdoms.at(lo).isAlive) continue;
                     if (!kingdoms.count(hi) || !kingdoms.at(hi).isAlive) continue;
-                    if (warCount >= 5) break;
+                    if (warCount >= 3) break;
 
                     const auto& ka = kingdoms.at(lo);
                     const auto& kb = kingdoms.at(hi);
-                    std::string label = ellipsize(ka.name, 12) + " vs " + ellipsize(kb.name, 12);
+                    std::string label = ellipsize(ka.name, 20) + " vs " + ellipsize(kb.name, 20);
 
                     drawRect(px, py, contentW, 21.f, sf::Color{40, 18, 18});
                     drawRect(px, py, 4.f, 21.f, sf::Color{200, 60, 60});
                     drawRect(px + 4.f, py, contentW / 2.f - 2.f, 21.f,
                              sf::Color{kingdomColor(lo).r, kingdomColor(lo).g,
                                        kingdomColor(lo).b, 40});
-                    drawText(label, px + 10.f, py + 4.f, 10, sf::Color{230, 130, 130});
+                    drawTextFit(label, px + 10.f, py + 4.f, contentW - 68.f, 10, sf::Color{230, 130, 130});
 
                     std::string turns = "T+" + std::to_string(rel.turnsAtWar);
                     drawText(turns, px + contentW - 48.f, py + 4.f, 10, sf::Color{160, 80, 80});
                     py += 24.f;
                     ++warCount;
                 }
-                if (warCount >= 5) break;
+                if (warCount >= 3) break;
             }
             if (warCount == 0) {
                 drawText("No active wars", px + 8.f, py, 10, sf::Color{80, 100, 80});
@@ -1858,7 +2389,7 @@ private:
 
         // sortedKingdoms_ is already sorted alive-first by population (cached per turn)
         size_t shownSituation = 0;
-        for (size_t si = 0; si < sortedKingdoms_.size() && shownSituation < 4; ++si) {
+        for (size_t si = 0; si < sortedKingdoms_.size() && shownSituation < 2; ++si) {
             const auto* k = sortedKingdoms_[si];
             if (!k->isAlive) break;
             // Policy colour: red=war/finalWar, blue=defend, gold=coalition, green=rebuild
@@ -1870,9 +2401,9 @@ private:
 
             drawRect(px, py, contentW, 24.f, sf::Color{22, 27, 36});
             drawRect(px, py, 4.f, 24.f, kingdomColor(k->id));
-            drawText(situationText(*k), px + 11.f, py + 5.f, 10, TEXT_COLOR);
-            drawText(std::string(jke::nationalPolicyName(k->policy)),
-                     px + 256.f, py + 5.f, 10, policyCol);
+            drawTextFit(situationText(*k), px + 11.f, py + 5.f, contentW - 130.f, 10, TEXT_COLOR);
+            drawTextFit(std::string(jke::nationalPolicyName(k->policy)),
+                        px + contentW - 112.f, py + 5.f, 106.f, 10, policyCol);
             py += 27.f;
             ++shownSituation;
         }
@@ -1906,29 +2437,30 @@ private:
             drawRect(px, py, 4.f, 32.f, kc);
 
             std::ostringstream line;
-            line << rank << ". " << ellipsize(k->name, 18);
+            line << rank << ". " << k->name;
 
-            drawText(line.str(), px + 12.f, py + 4.f, 12, k->isAlive ? TEXT_COLOR : DIM_COLOR);
+            drawTextFit(line.str(), px + 12.f, py + 4.f, contentW - 260.f, 12,
+                        k->isAlive ? TEXT_COLOR : DIM_COLOR);
 
             if (k->isAlive) {
                 std::ostringstream info;
                 info << "P " << compactNumber(k->totalPopulation)
                      << "  C" << k->cities.size()
                      << "  A" << k->armies.size();
-                drawText(info.str(), px + 156.f, py + 5.f, 11, DIM_COLOR);
+                drawTextFit(info.str(), px + contentW - 250.f, py + 5.f, 190.f, 11, DIM_COLOR);
 
                 // Ruler name + traits
                 if (k->hasRuler) {
-                    std::string rulerLine = ellipsize(k->ruler.name, 20);
+                    std::string rulerLine = k->ruler.name;
                     rulerLine += " (" + std::to_string(k->ruler.age) + ")";
-                    drawText(rulerLine, px + 12.f, py + 19.f, 9, sf::Color{180,160,110});
+                    drawTextFit(rulerLine, px + 12.f, py + 19.f, 210.f, 9, sf::Color{180,160,110});
                     // Traits
                     std::string traitLine;
                     for (size_t ti = 0; ti < k->ruler.traits.size(); ++ti) {
-                        if (ti > 0) traitLine += " · ";
+                        if (ti > 0) traitLine += " / ";
                         traitLine += std::string(jke::traitName(k->ruler.traits[ti]));
                     }
-                    drawText(traitLine, px + 140.f, py + 19.f, 9, sf::Color{140,150,170});
+                    drawTextFit(traitLine, px + 232.f, py + 19.f, contentW - 288.f, 9, sf::Color{140,150,170});
                 }
 
                 // War weariness bar
@@ -1944,25 +2476,25 @@ private:
                     drawText("W", barX - 10.f, barY - 1.f, 8, sf::Color{160, 80, 80});
                 }
             } else {
-                drawText("FALLEN", px + 278.f, py + 5.f, 11, sf::Color{190, 86, 86});
+                drawTextFit("FALLEN", px + contentW - 76.f, py + 5.f, 72.f, 11, sf::Color{190, 86, 86});
             }
 
             py += 40.f;
             rank++;
-            if (rank > 8) break;
+            if (rank > 4) break;
         }
 
         // Recent events
-        py += 12.f;
+        py += 8.f;
         drawSectionTitle("RECENT EVENTS", px, py);
         py += 30.f;
 
         const auto& all = engine_.timeline().all();
-        int start = std::max(0, static_cast<int>(all.size()) - 8);
+        int start = std::max(0, static_cast<int>(all.size()) - 4);
         for (int i = static_cast<int>(all.size()) - 1;
-             i >= start && py < WIN_H - 115; --i) {
+             i >= start && py < winH_ - 40; --i) {
             const auto& ev = all[i];
-            std::string desc = ellipsize(ev.description, 48);
+            std::string desc = ev.description;
             sf::Color ec = DIM_COLOR;
             if (ev.type == jke::EventType::KingdomCollapsed) ec = {220, 80, 80};
             if (ev.type == jke::EventType::WarDeclared)      ec = {220, 140, 60};
@@ -1974,40 +2506,8 @@ private:
 
             drawRect(px, py, contentW, 25.f, sf::Color{22, 27, 36});
             drawText(std::to_string(ev.turn), px + 9.f, py + 6.f, 10, MUTED_COLOR);
-            drawText(desc, px + 44.f, py + 5.f, 11, ec);
+            drawTextFit(desc, px + 44.f, py + 5.f, contentW - 52.f, 11, ec);
             py += 28.f;
-        }
-
-        // ── Population Graph ─────────────────────────────────────────────────
-        drawPopulationGraph(px, py);
-
-        // Legend (bottom of panel)
-        float ly = WIN_H - 132.f;
-        drawSectionTitle("TERRAIN", px, ly);
-        ly += 30.f;
-        const char* terrainNames[] = {"Ocean","Coast","Plain","Forest","Hill","Mtn","River","Lake"};
-        float lx = px;
-        for (int i = 0; i < 8; ++i) {
-            drawRect(lx, ly + 1.f, 11.f, 11.f, TERRAIN_COL[i], sf::Color{8, 10, 14}, 1.f);
-            drawText(terrainNames[i], lx + 12.f, ly, 10, DIM_COLOR);
-            lx += 52.f;
-            if (lx > PANEL_X + PANEL_W - 60) { lx = px; ly += 15.f; }
-        }
-
-        ly += 21.f;
-        const jke::TerrainType terrainOrder[] = {
-            jke::TerrainType::Plain, jke::TerrainType::Forest,
-            jke::TerrainType::Hill, jke::TerrainType::Mountain,
-            jke::TerrainType::River, jke::TerrainType::Coast
-        };
-        for (int i = 0; i < 6; ++i) {
-            float rowY = ly + static_cast<float>(i / 2) * 15.f;
-            float colX = px + static_cast<float>(i % 2) * 176.f;
-            auto terrain = terrainOrder[i];
-            drawRect(colX, rowY + 2.f, 8.f, 8.f, TERRAIN_COL[static_cast<int>(terrain)]);
-            drawText(std::string(terrainNames[static_cast<int>(terrain)]) + ": " +
-                     terrainEffectText(terrain),
-                     colX + 12.f, rowY, 9, MUTED_COLOR);
         }
     }
 };
@@ -2021,14 +2521,19 @@ int main(int argc, char** argv) {
         std::string a = argv[i];
         if      (a == "--seed"  && i+1 < argc) cfg.seed     = std::stoull(argv[++i]);
         else if (a == "--turns" && i+1 < argc) cfg.maxTurns = std::stoul(argv[++i]);
+        else if (a == "--kingdoms" && i+1 < argc) {
+            cfg.initialKingdoms =
+                std::clamp<uint32_t>(static_cast<uint32_t>(std::stoul(argv[++i])), 4u,
+                                     static_cast<uint32_t>(jke::constants::NUM_KINGDOMS));
+        }
     }
 
     std::cout << "JojiKingdomEngine Viewer\n";
     std::cout << "Seed: " << cfg.seed << "  MaxTurns: ";
     if (cfg.maxTurns == 0) std::cout << "unlimited";
     else std::cout << cfg.maxTurns;
-    std::cout << "\n";
-    std::cout << "Controls: Space=pause  Up/Down=speed  Right=step  Q=quit\n\n";
+    std::cout << "  Kingdoms: " << cfg.initialKingdoms << "\n";
+    std::cout << "Controls: Space=pause  Up/Down=speed  Right=step  [-]/[+]=kingdoms  Q=quit\n\n";
 
     Viewer viewer(cfg);
     viewer.run();

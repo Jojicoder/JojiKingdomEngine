@@ -1,3 +1,12 @@
+// DefensiveAI — 守城特化型
+// 該当王国: Stonegate（難攻不落の要塞都市）, Thornwall（孤立主義の茨の壁）, Ironhollow（崩壊した軍事大国の残骸）
+//
+// 戦略方針:
+//   - 基本的に戦争を仕掛けない。領土内に侵入した敵を迎え撃つ
+//   - 補給が切れた侵略軍を優先的に反撃（弱った敵を確実に仕留める）
+//   - 同盟を結んで外敵を抑止しつつ、内政と防衛力を固める
+//   - 追い詰められたときだけ限定的な反撃に出る
+
 #include "jke/ai/personalities/DefensiveAI.hpp"
 #include <algorithm>
 #include <cmath>

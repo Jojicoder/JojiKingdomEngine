@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <vector>
+#include <unordered_map>
 
 namespace jke {
 
@@ -68,7 +69,19 @@ void CityGenerator::generate(GeneratedWorld& world) {
             if (tile.terrain == TerrainType::Hill) score += 0.5f;
             if (isMountain)     score += 0.3f;  // mountain strongholds are valuable
             if (isCoast)        score += 0.6f;  // coastal ports are valuable
-            score += std::min(dist, 40.0f) * 0.03f;
+            // Distance weight scales with territory size: fewer kingdoms → larger
+            // territories → cities must spread further to cover them meaningfully.
+            //   ≤6 kingdoms: max +7.0 at 70 tiles — spread dominates
+            //  ≤12 kingdoms: max +3.3 at 55 tiles — moderate spread
+            //   20 kingdoms: max +1.2 at 40 tiles — unchanged original behaviour
+            const int totalKingdoms = static_cast<int>(world.kingdoms.size());
+            const float distWeight = (totalKingdoms <= 6) ? 0.10f
+                                   : (totalKingdoms <= 12) ? 0.06f
+                                   : 0.03f;
+            const float distCap    = (totalKingdoms <= 6) ? 70.0f
+                                   : (totalKingdoms <= 12) ? 55.0f
+                                   : 40.0f;
+            score += std::min(dist, distCap) * distWeight;
             candidates.push_back({tile.id, score, isMountain});
         }
 
@@ -120,8 +133,8 @@ void CityGenerator::generate(GeneratedWorld& world) {
         }
     }
 
-    // Second pass: neutral strategic outposts (river crossings, mountain passes)
-    // These start unclaimed and become early-game conquest targets
+    // Second pass: neutral strategic outposts (river crossings, mountain passes).
+    // Keep city density close to the 20-kingdom baseline even when fewer kingdoms start.
     placeNeutralOutposts(world);
 }
 
@@ -134,26 +147,28 @@ void CityGenerator::placeNeutralOutposts(GeneratedWorld& world) {
     std::vector<OutpostSite> sites;
 
     for (const auto& tile : world.worldMap.tiles()) {
-        if (tile.owner != NO_KINGDOM) continue;   // must be unclaimed
+        if (tile.owner != NO_KINGDOM) continue;
         if (tile.city  != NO_CITY)   continue;
         if (tile.terrain == TerrainType::Ocean ||
             tile.terrain == TerrainType::Lake)   continue;
 
-        float score = 0.0f;
-        // Value: river crossings, coasts, and mountain passes
+        // Large random jitter ensures outposts spread across the whole map.
+        // Terrain bonus is a tiebreaker, not a dominant factor.
+        float score = rng_.nextFloat(0.0f, 10.0f);
         if (tile.hasRiver || tile.terrain == TerrainType::River) score += 2.0f;
         if (tile.terrain == TerrainType::Coast)    score += 1.5f;
         if (tile.terrain == TerrainType::Mountain) score += 1.2f;
         if (tile.terrain == TerrainType::Hill)     score += 0.8f;
+        if (tile.terrain == TerrainType::Forest)   score += 0.6f;
         if (tile.fertility > 1.5f)                 score += 0.5f;
-        if (score < 1.0f) continue;
+        else if (tile.fertility > 0.8f)            score += 0.2f;
 
         // Must be at least 12 tiles from any existing city
         bool tooClose = false;
         for (const auto& [cid, city] : world.cities) {
             float d = std::hypot(float(tile.position.x - city.position.x),
                                  float(tile.position.y - city.position.y));
-            if (d < 12.0f) { tooClose = true; break; }
+            if (d < 9.0f) { tooClose = true; break; }
         }
         if (tooClose) continue;
 
@@ -163,16 +178,23 @@ void CityGenerator::placeNeutralOutposts(GeneratedWorld& world) {
     std::sort(sites.begin(), sites.end(),
               [](const OutpostSite& a, const OutpostSite& b){ return a.score > b.score; });
 
-    // Place more neutral outposts, spaced enough to create local objectives.
+    // Keep the total number of conquerable city/outpost anchors stable across
+    // different starting kingdom counts.
+    const int baselineTotalAnchors = constants::NUM_KINGDOMS * 8 + 200;
+    const int targetOutposts = std::max(
+        0, baselineTotalAnchors - static_cast<int>(world.cities.size()));
+
+    // Place neutral outposts, spaced enough to create local objectives.
     int placed = 0;
+    std::unordered_map<int, int> terrainCounter; // per-terrain name index
     std::vector<Coordinate> placedPos;
     for (const auto& s : sites) {
-        if (placed >= 36) break;
+        if (placed >= targetOutposts) break;
         auto pos = world.worldMap.at(s.tile).position;
 
         bool tooClose = false;
         for (const auto& p : placedPos) {
-            if (std::hypot(float(pos.x - p.x), float(pos.y - p.y)) < 14.0f) {
+            if (std::hypot(float(pos.x - p.x), float(pos.y - p.y)) < 8.0f) {
                 tooClose = true; break;
             }
         }
@@ -186,10 +208,13 @@ void CityGenerator::placeNeutralOutposts(GeneratedWorld& world) {
         outpost.position      = pos;
         outpost.isCapital     = false;
         outpost.foundedTurn   = 0;
-        outpost.name          = generateOutpostName(t.terrain);
+        const int terrainKey  = static_cast<int>(t.terrain);
+        outpost.name          = generateOutpostName(t.terrain, terrainCounter[terrainKey]++);
+
         outpost.population    = rng_.nextInt(120, 420);
         outpost.baseProduction.food  = 5.0f  * t.fertility;
         outpost.baseProduction.gold  = 2.5f;
+        outpost.baseProduction.wood  = (t.terrain == TerrainType::Forest) ? 8.0f : 2.0f;
         outpost.baseProduction.iron  = t.resourceRichness * 3.0f;
         outpost.baseProduction.stone = (t.terrain == TerrainType::Mountain ||
                                         t.terrain == TerrainType::Hill) ? 7.0f : 2.0f;
@@ -201,6 +226,7 @@ void CityGenerator::placeNeutralOutposts(GeneratedWorld& world) {
 
         CityID cid = world.nextCityID++;
         outpost.id = cid;
+        world.worldMap.at(s.tile).owner = NO_KINGDOM;
         world.worldMap.at(s.tile).city = cid;
         world.cities[cid] = std::move(outpost);
         placedPos.push_back(pos);
@@ -375,38 +401,116 @@ void CityGenerator::assignCityType(City& city, const Tile& t,
 
 std::string CityGenerator::generateCityName(const std::string& kingdomName,
                                               bool isCapital) const {
-    if (isCapital) return kingdomName + " City";
-    static const std::string suffixes[] = {
-        "ford", "haven", "wick", "gate", "keep",
-        "hold", "burg", "vale", "moor", "fell"
+    // Per-kingdom naming style — lore-driven city names
+    // Capital uses the kingdom name itself; settlements use themed prefix+suffix
+    struct KingdomNaming {
+        std::array<const char*, 5> prefixes;
+        std::array<const char*, 5> suffixes;
     };
-    return kingdomName.substr(0, 4) + suffixes[rng_.nextInt(0, 9)];
+    static const std::unordered_map<std::string, KingdomNaming> table = {
+        // Noble trade empire
+        {"Valdoria",    {{"Golden","Noble","Crown","Grand","High"},     {"court","hall","vale","reach","shire"}}},
+        // Iron military empire expanding outward
+        {"Ironspire",   {{"Steel","Forge","Iron","Anvil","Smelter"},    {"hold","keep","bastion","gate","burg"}}},
+        // Mystical research nation on foggy moors
+        {"Aethermoor",  {{"Aether","Mist","Veil","Arcane","Ether"},     {"spire","haven","moor","reach","sanctum"}}},
+        // Warm agricultural nation, peaceful
+        {"Sunhaven",    {{"Sun","Gold","Bright","Dawn","Warm"},         {"field","haven","meadow","lea","glow"}}},
+        // Dark conquering thorn kingdom
+        {"Blackthorn",  {{"Dark","Grim","Shadow","Iron","Blood"},       {"thorn","fell","hollow","pit","scar"}}},
+        // Merchant nation trading everything
+        {"Goldenveil",  {{"Gold","Silk","Silver","Amber","Veil"},       {"veil","port","market","cove","crossing"}}},
+        // Fortress nation, stone walls everywhere
+        {"Stonegate",   {{"Stone","Grey","Iron","Rock","Flint"},        {"gate","wall","ward","keep","pass"}}},
+        // Peaceful river farming nation
+        {"Rivermark",   {{"River","Mill","Ford","Bridge","Tide"},       {"ford","bridge","bank","weir","crossing"}}},
+        // Opportunistic survivors of a fallen kingdom
+        {"Ashford",     {{"Ash","Ember","Cinder","Dust","Grey"},        {"ford","hollow","ruin","wick","remnant"}}},
+        // Precision technology island nation
+        {"Crystalholm", {{"Crystal","Glass","Prism","Gem","Quartz"},    {"holm","spire","peak","point","shard"}}},
+        // Vast fire military empire
+        {"Embervast",   {{"Ember","Flame","Blaze","Char","Singe"},      {"vast","forge","march","hearth","kiln"}}},
+        // Expansionist agricultural frontier nation
+        {"Dawnreach",   {{"Dawn","First","New","Far","East"},           {"reach","land","plain","step","hold"}}},
+        // Isolationist thorn fortress nation
+        {"Thornwall",   {{"Thorn","Spike","Briar","Barb","Hook"},       {"wall","keep","ward","hedge","barrier"}}},
+        // Silver trade nation with sharp business sense
+        {"Silvershard", {{"Silver","Bright","Clear","White","Moon"},    {"shard","port","croft","bay","quay"}}},
+        // Proud highland expansionist kingdom
+        {"Highcrest",   {{"High","Peak","Crown","Summit","Ridge"},      {"crest","mount","ridge","top","heights"}}},
+        // Fog forest opportunist nation
+        {"Mistwood",    {{"Mist","Fog","Shadow","Shroud","Grey"},       {"wood","grove","hollow","copse","thicket"}}},
+        // Twilight survivor kingdom, grasping at any opportunity
+        {"Duskfell",    {{"Dusk","Twilight","Grey","Fading","Last"},    {"fell","heath","moor","end","watch"}}},
+        // Ambitious crown-hungry economic empire
+        {"Crownsreach", {{"Crown","Royal","Grand","Imperial","Sovereign"},{"reach","hall","court","palace","seat"}}},
+        // Hollow remnant of an ancient iron military power
+        {"Ironhollow",  {{"Iron","Rust","Old","Ancient","Hollow"},      {"hollow","ruin","hold","depths","vault"}}},
+        // Aggressive border nation, always at war
+        {"Embermarch",  {{"Ember","Scar","Ash","Char","Burnt"},         {"march","post","watch","outpost","front"}}},
+    };
+
+    if (isCapital) return kingdomName;
+
+    auto it = table.find(kingdomName);
+    if (it == table.end()) {
+        static const std::string fallback[] = {"ford","haven","wick","gate","keep","hold","burg","vale","moor","fell"};
+        return kingdomName.substr(0, 4) + fallback[rng_.nextInt(0, 9)];
+    }
+    const auto& n = it->second;
+    return std::string(n.prefixes[rng_.nextInt(0, 4)]) + n.suffixes[rng_.nextInt(0, 4)];
 }
 
-std::string CityGenerator::generateOutpostName(TerrainType terrain) const {
+std::string CityGenerator::generateOutpostName(TerrainType terrain, int index) const {
+    // 20 unique names per category; sequential index prevents duplicates within each run.
+    // If more than 20 of one type are ever needed, wrap with a roman-numeral suffix.
     static const std::string mountain[] = {
-        "Stonepass", "Ironpeak", "Greyspire", "Rimwatch", "Frostcrag",
-        "Duskwall", "Shadowcleft", "Ashpeak", "Thornspire", "Coldgap"
+        "Stonepass",  "Ironpeak",    "Greyspire",   "Rimwatch",   "Frostcrag",
+        "Duskwall",   "Shadowcleft", "Ashpeak",      "Thornspire", "Coldgap",
+        "Frostgate",  "Icepeak",     "Steelcliff",  "Granitecrest","Bleakhold",
+        "Cobaltridge","Stormcrag",   "Windpass",    "Ironwall",   "Dreadspire"
     };
     static const std::string coast[] = {
-        "Saltwatch", "Ironharbor", "Seagate", "Wavebreak", "Tidemark",
-        "Drifthaven", "Gullrock", "Brinecroft", "Foamhold", "Stormcove"
+        "Saltwatch",  "Ironharbor",  "Seagate",     "Wavebreak",  "Tidemark",
+        "Drifthaven", "Gullrock",    "Brinecroft",  "Foamhold",   "Stormcove",
+        "Shorehold",  "Breakwater",  "Mireport",    "Cliffwatch", "Sandgate",
+        "Deepwater",  "Harborwall",  "Mistport",    "Cragcove",   "Swellbreak"
     };
     static const std::string river[] = {
-        "Fordkeep", "Bridgewatch", "Crossgate", "Millpoint", "Rivermark",
-        "Floodstop", "Shallows", "Weirdford", "Rushgate", "Forkhold"
+        "Fordkeep",   "Bridgewatch", "Crossgate",   "Millpoint",  "Rushgate",
+        "Floodstop",  "Shallows",    "Weirdford",   "Forkhold",   "Tidegate",
+        "Riverstop",  "Bankwatch",   "Stoneferry",  "Mudcross",   "Quickford",
+        "Longbridge", "Reedgate",    "Swiftpass",   "Brookhold",  "Driftford"
     };
-    static const std::string generic[] = {
-        "Outpost", "Waypost", "Redoubt", "Bulwark", "Bastion",
-        "Rampart", "Stockade", "Citadel", "Watchtower", "Garrison"
+    static const std::string forest[] = {
+        "Deepwood",   "Timberhold",  "Greenwatch",  "Mossgate",   "Briarpost",
+        "Fernkeep",   "Ashgrove",    "Oakwatch",    "Thornwood",  "Willowfort",
+        "Darkbough",  "Pinecrest",   "Elmstop",     "Cedarhold",  "Birchwall",
+        "Ivygate",    "Hazelkeep",   "Rootwatch",   "Barkfort",   "Canopypost"
     };
+    static const std::string plain[] = {
+        "Waypost",    "Redoubt",     "Bulwark",     "Bastion",    "Rampart",
+        "Stockade",   "Watchtower",  "Garrison",    "Outpost",    "Lookout",
+        "Fieldfort",  "Dusthold",    "Plainwatch",  "Dirtgate",   "Grasskeep",
+        "Ridgepost",  "Hillock",     "Knollwatch",  "Meadowfort", "Cropwatch"
+    };
+
+    const std::string* pool = plain;
+    int poolSize = 20;
     switch (terrain) {
-        case TerrainType::Mountain: return mountain[rng_.nextInt(0, 9)];
-        case TerrainType::Hill:     return mountain[rng_.nextInt(0, 9)];
-        case TerrainType::Coast:    return coast[rng_.nextInt(0, 9)];
-        case TerrainType::River:    return river[rng_.nextInt(0, 9)];
-        default:                    return generic[rng_.nextInt(0, 9)];
+        case TerrainType::Mountain:
+        case TerrainType::Hill:   pool = mountain; break;
+        case TerrainType::Coast:  pool = coast;    break;
+        case TerrainType::River:  pool = river;    break;
+        case TerrainType::Forest: pool = forest;   break;
+        default:                  pool = plain;    break;
     }
+    const int slot = index % poolSize;
+    if (index < poolSize) return pool[slot];
+    // Wrap suffix for extreme outpost counts (unlikely but safe)
+    static const char* suffix[] = {"II","III","IV","V","VI","VII","VIII","IX","X"};
+    const int wrap = std::min(index / poolSize - 1, 8);
+    return pool[slot] + " " + suffix[wrap];
 }
 
 } // namespace jke
